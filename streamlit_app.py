@@ -302,6 +302,67 @@ def parse_rsm(raw: bytes, filename: str = "case.RSM") -> dict[str, Any]:
     return {"data": combined, "metadata": meta, "qc": result_qc}
 
 
+# Descriptive names are kept separate from ECLIPSE keywords so exports remain stable.
+# Vectors with less certain semantics retain neutral names rather than misleading labels.
+KEYWORD_NAMES = {
+    "FPR": "Field Average Reservoir Pressure", "WBHP": "Well Bottomhole Pressure",
+    "WTHP": "Well Tubing Head Pressure", "WBP9": "Well Block Pressure (WBP9)",
+    "WPI": "Well Productivity Index", "WSTAT": "Well Status",
+    "FOE": "Field Oil Recovery Efficiency", "FRS": "Field Ratio / RSM Summary",
+    "FRV": "Field Reservoir Volume Ratio", "TIMESTEP": "Simulation Time Step",
+    "YEARS": "Simulation Years", "AAQP": "Aquifer Pressure",
+    "AAQR": "Aquifer Flow Rate", "AAQT": "Cumulative Aquifer Flow",
+    "AAQPD": "Aquifer Diagnostic (AAQPD)", "AAQTD": "Aquifer Diagnostic (AAQTD)",
+    "WEPR": "Well Energy Production Rate",
+}
+_FLUID_NAMES = {"O": "Oil", "W": "Water", "G": "Gas", "V": "Reservoir Volume"}
+_ACTIVITY_NAMES = {
+    "PR": "Production Rate", "PT": "Cumulative Production", "IR": "Injection Rate",
+    "IT": "Cumulative Injection", "IP": "In Place", "CT": "Cut",
+    "OR": "Oil-Gas Ratio", "GR": "Water-Gas Ratio",
+}
+
+
+def keyword_description(keyword: str) -> str:
+    """Human-readable descriptor without changing the RSM's original keyword."""
+    k = str(keyword).upper().strip()
+    if k in KEYWORD_NAMES:
+        return KEYWORD_NAMES[k]
+    if len(k) >= 4 and k[0] in 'FWG' and k[1] in _FLUID_NAMES:
+        level = {'F': 'Field', 'W': 'Well', 'G': 'Group'}[k[0]]
+        fluid = _FLUID_NAMES[k[1]]
+        tail = k[2:]
+        if tail in _ACTIVITY_NAMES:
+            activity = _ACTIVITY_NAMES[tail]
+            if tail == 'OR':
+                return f"{level} Gas-Oil Ratio"  # xGOR = GOR (not oil/gas)
+            if tail == 'GR':
+                return f"{level} Water-Gas Ratio"
+            return f"{level} {fluid} {activity}"
+        if tail == 'IPG':
+            return f"{level} {fluid} In Place (Gas Phase)"
+        if tail == 'IPL':
+            return f"{level} {fluid} In Place (Liquid Phase)"
+    return f"ECLIPSE Summary Variable ({k})"
+
+
+def keyword_label(keyword: str) -> str:
+    return f"{keyword} — {keyword_description(keyword)}"
+
+
+def fluid_family(keyword: str) -> str:
+    k = str(keyword).upper()
+    if k in ('FPR', 'WBHP', 'WTHP', 'WBP9', 'AAQP'):
+        return 'Pressure'
+    if k.endswith(('WCT', 'WGR')) or (len(k) > 1 and k[1] == 'W'):
+        return 'Water'
+    if k.endswith('GOR') or (len(k) > 1 and k[1] == 'G'):
+        return 'Gas'
+    if len(k) > 1 and k[1] == 'O':
+        return 'Oil'
+    return 'Other'
+
+
 def metadata_filter(parsed: dict, level: str | None = None,
                     keywords: Optional[Iterable[str]] = None,
                     entities: Optional[Iterable[str]] = None) -> pd.DataFrame:
@@ -329,7 +390,7 @@ def make_long_csv(cases: dict[str, dict], selection: dict[str, pd.DataFrame],
     buf = io.StringIO(newline="")
     writer = csv.writer(buf)
     writer.writerow(["Case", "Date", "Time_Days", "Years", "Level", "Entity",
-                     "Variable", "Keyword", "Unit", "Value"])
+                     "Variable", "Keyword", "Column_Name", "Unit", "Value"])
     for name, parsed in cases.items():
         df = parsed["data"]
         m = selection.get(name)
@@ -345,12 +406,13 @@ def make_long_csv(cases: dict[str, dict], selection: dict[str, pd.DataFrame],
             for d, t, y, v in zip(dates, td, year, values):
                 if np.isfinite(v):
                     writer.writerow([name, d, float(t), float(y), r.Level, r.Entity,
-                                     r.Variable, r.Keyword, unit, float(v)])
+                                     r.Variable, r.Keyword, keyword_description(r.Keyword), unit, float(v)])
     return buf.getvalue().encode("utf-8-sig")
 
 
 def make_wide_csv(cases: dict[str, dict], selection: dict[str, pd.DataFrame],
-                  unit_system: str, gas_display: str, start_date=None) -> bytes:
+                  unit_system: str, gas_display: str, start_date=None,
+                  descriptive_headers: bool = False) -> bytes:
     """One row per (Case, Time_Days, Level, Entity), each variable a column.
 
     Preserves per-column units in a companion Data Dictionary rather than
@@ -378,9 +440,13 @@ def make_wide_csv(cases: dict[str, dict], selection: dict[str, pd.DataFrame],
             for r in sub.itertuples(index=False):
                 arr, _ = value_and_unit(frame[r.Column_ID].to_numpy(), r._asdict(),
                                         unit_system, gas_display)
-                name = r.Variable
-                if name in part.columns:
-                    name += "__duplicate"
+                name = (f"{r.Variable} — {keyword_description(r.Keyword)}"
+                        if descriptive_headers else r.Variable)
+                base_name = name
+                duplicate = 2
+                while name in part.columns:
+                    name = f"{base_name}__duplicate_{duplicate}"
+                    duplicate += 1
                 part[name] = arr
             pieces.append(part)
     if not pieces:
@@ -401,6 +467,7 @@ def make_dictionary_csv(cases: dict[str, dict], selection: dict[str, pd.DataFram
                                                             unit_system, gas_display)
             data.append({"Case": name, "Level": r.Level, "Entity": r.Entity,
                          "Variable": r.Variable, "Keyword": r.Keyword,
+                         "Column_Name": keyword_description(r.Keyword),
                          "Original_Unit": r.Source_Unit,
                          "Original_RSM_Scale": r.Scale_Factor,
                          "Export_Unit": target_unit,
@@ -408,525 +475,720 @@ def make_dictionary_csv(cases: dict[str, dict], selection: dict[str, pd.DataFram
     return pd.DataFrame(data).to_csv(index=False).encode("utf-8-sig")
 
 # ---- Streamlit user interface ----
-"""Eclipse RSM Studio — upload, compare, visualize and Spotfire export .RSM runs.
-
-Run locally:
-  pip install -r requirements.txt
-  streamlit run app.py
-"""
-
+"""Modern single-file Streamlit app. No local Python imports are required."""
 from datetime import date
 from pathlib import Path
-import io
+import html
+import math
 import zipfile
 
-import numpy as np
-import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
-# Parser and conversion helpers are embedded above (single-file edition).
+st.set_page_config(page_title='Eclipse RSM Studio Pro', page_icon='📊', layout='wide')
 
-st.set_page_config(page_title="Eclipse RSM Studio", page_icon="📈", layout="wide")
-st.markdown("""
-<style>
-    .block-container {padding-top: 1.45rem; max-width: 1750px;}
-    h1, h2, h3 {letter-spacing: -0.02em;}
-    [data-testid="stMetricValue"] {font-size: 1.75rem; font-weight: 700;}
-    div[data-testid="stVerticalBlockBorderWrapper"] {border-radius: 12px;}
-    .rsm-subtitle {color: #667085; font-size: 1rem; margin-top: -0.7rem; margin-bottom: 1rem;}
-    .rsm-note {color: #667085; font-size: .82rem;}
-</style>
-""", unsafe_allow_html=True)
+DEFAULT_PALETTE = {
+    'Oil': '#16A34A', 'Gas': '#DC2626', 'Water': '#2563EB',
+    'Pressure': '#D97706', 'Other': '#7C3AED',
+}
+CASE_COLORS = px.colors.qualitative.Safe
+ENTITY_COLORS = px.colors.qualitative.Bold
+LINE_DASHES = ['solid', 'dash', 'dot', 'dashdot', 'longdash', 'longdashdot']
+
+
+def time_axis(days, mode, start_date):
+    if mode == 'Years':
+        return np.asarray(days, dtype=float) / 365.25
+    if mode == 'Date' and start_date is not None:
+        return pd.Timestamp(start_date) + pd.to_timedelta(days, unit='D')
+    return np.asarray(days, dtype=float)
+
+
+def axis_label(mode):
+    return {'Time (days)': 'Simulation time (days)', 'Years': 'Simulation time (years)',
+            'Date': 'Calendar date'}.get(mode, 'Simulation time')
+
+
+def trace_data(parsed, keyword, level, entity, unit_system, gas_display):
+    meta = metadata_filter(parsed, level, [keyword], [entity])
+    if meta.empty:
+        return None
+    r = meta.iloc[0]
+    values, unit = value_and_unit(parsed['data'][r.Column_ID].to_numpy(), r, unit_system, gas_display)
+    return parsed['data'].index.to_numpy(dtype=float), values, unit
+
+
+def style_markup(text, style):
+    text = html.escape(str(text))
+    if 'Bold' in style:
+        text = '<b>' + text + '</b>'
+    if 'Italic' in style:
+        text = '<i>' + text + '</i>'
+    return text
+
+
+def rgba_from_hex(value, opacity):
+    """Apply line/area opacity to Plotly hex, rgb() and rgba() colors."""
+    value = str(value).strip()
+    h = value.lstrip('#')
+    if re.fullmatch('[0-9a-fA-F]{6}', h):
+        parts = (int(h[i:i+2],16) for i in (0,2,4))
+    elif value.startswith(('rgb(', 'rgba(')):
+        nums = re.findall(r'[0-9.]+', value)
+        if len(nums) < 3:
+            return value
+        parts = tuple(int(float(v)) for v in nums[:3])
+    else:
+        return value
+    red,green,blue = parts
+    return f'rgba({red},{green},{blue},{float(opacity):.3f})'
+
+
+def collect_plot_records(cases, level, keywords, entities, system, gas_display,
+                         watercut_percent=True, maximum=250):
+    """Collection for graphing only. Full CSV export is never truncated."""
+    records = []
+    for case, parsed in cases.items():
+        for key in keywords:
+            for entity in entities:
+                if len(records) >= maximum:
+                    return records, True
+                series = trace_data(parsed, key, level, entity, system, gas_display)
+                if series is None:
+                    continue
+                days, values, unit = series
+                if key.endswith('WCT') and watercut_percent:
+                    values = values * 100
+                    unit = '%'
+                records.append(dict(case=case, entity=entity, key=key,
+                                    days=days, values=values, unit=unit))
+    return records, False
+
+
+def plot_color(rec, color_by, palette, cases, entities, keywords):
+    if color_by == 'Case':
+        return CASE_COLORS[list(cases).index(rec['case']) % len(CASE_COLORS)]
+    if color_by == 'Well / Entity':
+        return ENTITY_COLORS[list(entities).index(rec['entity']) % len(ENTITY_COLORS)]
+    if color_by == 'Keyword':
+        return CASE_COLORS[list(keywords).index(rec['key']) % len(CASE_COLORS)]
+    return palette[fluid_family(rec['key'])]
+
+
+def chart_factory(records, mode, start_date, level, cases, entities, keywords,
+                  palette, settings, trellis_by=None, nrows=1, ncols=1, page=1):
+    """Overlay or paged Spotfire-like Trellis, with at most two axes per panel."""
+    facets = ['ALL']
+    if trellis_by == 'Case':
+        facets = list(dict.fromkeys(r['case'] for r in records))
+    elif trellis_by == 'Well / Entity':
+        facets = list(dict.fromkeys(r['entity'] for r in records))
+    elif trellis_by == 'Keyword':
+        facets = list(dict.fromkeys(r['key'] for r in records))
+    is_trellis = trellis_by is not None
+    if not is_trellis:
+        nrows, ncols = 1, 1
+    cells = nrows * ncols
+    active_facets = facets[(page-1)*cells:page*cells]
+    if not active_facets:
+        active_facets = ['ALL']
+    rows_used = math.ceil(len(active_facets)/ncols)
+    fig = make_subplots(
+        rows=rows_used, cols=ncols,
+        specs=[[{'secondary_y': True} for _ in range(ncols)] for _ in range(rows_used)],
+        subplot_titles=([style_markup(keyword_label(s) if trellis_by == 'Keyword' else s,
+                                     settings['Font style']) for s in active_facets]
+                        if is_trellis else None),
+        shared_xaxes='all' if is_trellis else False,
+        vertical_spacing=min(0.16, max(0.045, 0.30/rows_used)),
+        horizontal_spacing=min(0.11, max(0.045, 0.18/ncols)),
+    )
+    units_by_panel = {}
+    skipped_units = set()
+    seen_legends = set()
+    num_traces = 0
+    for idx, facet in enumerate(active_facets):
+        row = idx // ncols + 1
+        col = idx % ncols + 1
+        panel = [r for r in records if (
+            facet == 'ALL' or
+            (trellis_by == 'Case' and r['case'] == facet) or
+            (trellis_by == 'Well / Entity' and r['entity'] == facet) or
+            (trellis_by == 'Keyword' and r['key'] == facet))]
+        local_units = list(dict.fromkeys(r['unit'] for r in panel))
+        units_by_panel[(row, col)] = local_units[:2]
+        if len(local_units) > 2:
+            skipped_units.update(local_units[2:])
+        for r in panel:
+            if r['unit'] not in local_units[:2]:
+                continue
+            second = len(local_units) > 1 and r['unit'] == local_units[1]
+            name = f"{r['case']} · {r['entity']} · {r['key']}"
+            if level == 'Field':
+                name = f"{r['case']} · {r['key']}"
+            label = keyword_label(r['key'])
+            key = (r['case'], r['entity'], r['key'])
+            color = plot_color(r, settings['Color by'], palette, cases, entities, keywords)
+            dash_id = list(cases).index(r['case']) + list(entities).index(r['entity'])
+            linestyle = LINE_DASHES[dash_id % len(LINE_DASHES)] if settings['Distinguish lines'] else 'solid'
+            y = r['values']
+            x = time_axis(r['days'], mode, start_date)
+            if len(y) > settings['Max chart points']:
+                keep = np.unique(np.linspace(0, len(y)-1, settings['Max chart points'], dtype=int))
+                x, y = x[keep], y[keep]
+            trace = go.Scattergl(
+                x=x, y=y, mode='lines', name=name,
+                legendgroup=name, showlegend=name not in seen_legends,
+                line=dict(color=rgba_from_hex(color, settings['Line opacity']),
+                          width=settings['Line width'], dash=linestyle),
+                connectgaps=False,
+                fill='tozeroy' if settings['Area fill'] and not second else None,
+                fillcolor=rgba_from_hex(color, settings['Area opacity']),
+                hovertemplate=(f"<b>{html.escape(r['case'])}</b> · {html.escape(r['entity'])}"
+                               f"<br>{html.escape(label)}"
+                               f"<br>{axis_label(mode)}: %{{x}}"
+                               f"<br>Value: %{{y:,.4g}} {html.escape(r['unit'])}<extra></extra>"),
+            )
+            seen_legends.add(name)
+            fig.add_trace(trace, row=row, col=col, secondary_y=second)
+            num_traces += 1
+        if local_units:
+            fig.update_yaxes(title_text=style_markup(local_units[0], settings['Font style'])
+                             if col == 1 else None,
+                             row=row, col=col, secondary_y=False)
+            if len(local_units) > 1:
+                fig.update_yaxes(title_text=style_markup(local_units[1], settings['Font style'])
+                                 if col == ncols else None,
+                                 row=row, col=col, secondary_y=True)
+        if row == rows_used:
+            fig.update_xaxes(title_text=style_markup(axis_label(mode), settings['Font style']),
+                             row=row, col=col)
+    is_dark = settings['Theme'] == 'Dark'
+    base_text = '#E2E8F0' if is_dark and not settings['Transparent background'] else '#334155'
+    grid = (f"rgba(148,163,184,{settings['Grid opacity']:.2f})"
+            if settings['Show grid'] else 'rgba(0,0,0,0)')
+    paper = 'rgba(0,0,0,0)' if settings['Transparent background'] else ('#0F172A' if is_dark else '#FFFFFF')
+    plot = 'rgba(0,0,0,0)' if settings['Transparent background'] else ('#111827' if is_dark else '#FFFFFF')
+    font_family = 'Arial Black, Arial, sans-serif' if 'Bold' in settings['Font style'] else ('Georgia, serif' if 'Italic' in settings['Font style'] else 'Arial, sans-serif')
+    fig.update_layout(
+        template='plotly_dark' if is_dark else 'plotly_white',
+        title=dict(text=style_markup(settings['Chart title'], settings['Font style']),
+                   x=0.015, xanchor='left', font=dict(size=settings['Font size']+5)),
+        font=dict(family=font_family, size=settings['Font size'], color=base_text),
+        paper_bgcolor=paper, plot_bgcolor=plot,
+        height=max(360, settings['Panel height']*rows_used+150),
+        margin=dict(t=95 if is_trellis else 85, b=115, l=65, r=65),
+        legend=dict(orientation='h', yanchor='top', y=-0.16, xanchor='left', x=0,
+                    bgcolor='rgba(0,0,0,0)', font=dict(size=max(9,settings['Font size']-1))),
+        hovermode='closest' if is_trellis else 'x unified',
+    )
+    fig.update_xaxes(showgrid=settings['Show grid'], gridcolor=grid,
+                     zeroline=False, showline=True, linecolor=grid,
+                     tickfont=dict(size=max(settings['Font size']-1, 9)))
+    fig.update_yaxes(showgrid=settings['Show grid'], gridcolor=grid,
+                     zeroline=False, showline=False,
+                     tickfont=dict(size=max(settings['Font size']-1, 9)))
+    if fig.layout.annotations:
+        fig.update_annotations(font=dict(size=max(10, settings['Font size']+1), color=base_text))
+    return fig, num_traces, skipped_units
+
+
+def summarize_last(cases, level, keywords, entities, system, gas_display):
+    recs = []
+    for case, parsed in cases.items():
+        for key in keywords:
+            for entity in entities:
+                curve = trace_data(parsed, key, level, entity, system, gas_display)
+                if curve is None:
+                    continue
+                days, y, unit = curve
+                idx = np.flatnonzero(np.isfinite(y))
+                if len(idx):
+                    i = idx[-1]
+                    recs.append(dict(Case=case, Level=level, Entity=entity,
+                                     Keyword=key, Column_Name=keyword_description(key),
+                                     Time_Days=float(days[i]), Value=float(y[i]), Unit=unit))
+    return pd.DataFrame(recs)
+
+
+def preview_records(cases, level, keywords, entities, system, gas_display,
+                    start_date, limit=3000):
+    chunks = []
+    remaining = limit
+    for case, parsed in cases.items():
+        m = metadata_filter(parsed, level, keywords, entities)
+        td = parsed['data'].index.to_numpy(dtype=float)
+        for r in m.itertuples(index=False):
+            if remaining <= 0:
+                break
+            v, unit = value_and_unit(parsed['data'][r.Column_ID].to_numpy(),
+                                     r._asdict(), system, gas_display)
+            n = min(remaining, len(td))
+            part = pd.DataFrame({'Case': case, 'Time_Days': td[:n],
+                                 'Years': td[:n]/365.25, 'Level': r.Level,
+                                 'Entity': r.Entity, 'Keyword': r.Keyword,
+                                 'Column_Name': keyword_description(r.Keyword),
+                                 'Variable': r.Variable, 'Unit': unit, 'Value': v[:n]})
+            if start_date is not None:
+                part.insert(1, 'Date', pd.Timestamp(start_date) + pd.to_timedelta(td[:n], unit='D'))
+            chunks.append(part)
+            remaining -= n
+        if remaining <= 0:
+            break
+    return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def cached_parse(raw: bytes, filename: str) -> dict:
+def cached_parse(raw: bytes, filename: str):
     return parse_rsm(raw, filename)
 
 
-def to_x(times: np.ndarray, mode: str, start_date):
-    if mode == "Years":
-        return times / 365.25
-    if mode == "Date" and start_date is not None:
-        return pd.Timestamp(start_date) + pd.to_timedelta(times, unit="D")
-    return times
+st.markdown('''
+<style>
+.block-container {padding-top: 1.2rem; max-width: 1750px;}
+h1,h2,h3 {letter-spacing:-.025em;}
+[data-testid="stMetricValue"] {font-size:1.8rem; font-weight:700;}
+div[data-testid="stVerticalBlockBorderWrapper"] {border-radius:14px;}
+.rsm-subtitle {color:#64748b;font-size:1rem;margin-top:-.5rem;margin-bottom:1.2rem;}
+.rsm-note {color:#64748b;font-size:.83rem;}
+</style>
+''', unsafe_allow_html=True)
 
-
-def x_label(mode: str) -> str:
-    return {"Time (days)": "Simulation time (days)",
-            "Years": "Simulation time (years)", "Date": "Date"}.get(mode, "Simulation time")
-
-
-def trace_data(parsed: dict, keyword: str, level: str, entity: str,
-               system: str, gas_display: str):
-    m = metadata_filter(parsed, level, [keyword], [entity])
-    if m.empty:
-        return None
-    # Identical vector+entity+qualifier may theoretically recur; pick the first.
-    r = m.iloc[0]
-    values, unit = value_and_unit(parsed["data"][r.Column_ID].to_numpy(),
-                                  r, system, gas_display)
-    return parsed["data"].index.to_numpy(dtype=float), values, unit
-
-
-def make_line_chart(cases: dict, level: str, keyword: str, entities: list[str],
-                    system: str, gas_display: str, mode: str, start_date,
-                    pct_watercut: bool = True, max_lines: int = 100,
-                    height: int = 430) -> tuple[go.Figure, int]:
-    fig = go.Figure()
-    unit_name = ""
-    traces = 0
-    for case, parsed in cases.items():
-        for entity in entities:
-            if traces >= max_lines:
-                break
-            ser = trace_data(parsed, keyword, level, entity, system, gas_display)
-            if ser is None:
-                continue
-            days, y, unit = ser
-            if keyword.endswith("WCT") and pct_watercut:
-                y = y * 100
-                unit = "%"
-            unit_name = unit
-            name = f"{case} · {entity}" if level != "Field" else case
-            fig.add_trace(go.Scattergl(
-                x=to_x(days, mode, start_date), y=y,
-                mode="lines", name=name, connectgaps=False,
-                hovertemplate=f"{name}<br>{x_label(mode)}: %{{x}}<br>Value: %{{y:,.4g}} {unit}<extra></extra>",
-                line=dict(width=2),
-            ))
-            traces += 1
-    fig.update_layout(
-        title=dict(text=f"{keyword} · {level}", font=dict(size=18)),
-        height=height, template="plotly_white",
-        xaxis_title=x_label(mode), yaxis_title=f"{keyword} ({unit_name})",
-        margin=dict(t=65, b=45, l=58, r=15),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="left", x=0, title=None),
-        hovermode="x unified" if level == "Field" else "closest",
-    )
-    fig.update_xaxes(showgrid=True, gridcolor="rgba(148,163,184,0.12)")
-    fig.update_yaxes(showgrid=True, gridcolor="rgba(148,163,184,0.18)", rangemode="tozero")
-    return fig, traces
-
-
-def make_small_csv_preview(cases: dict, level: str, keywords: list[str],
-                           entities: list[str], system: str, gas_display: str,
-                           start_date, limit: int = 3000) -> pd.DataFrame:
-    pieces = []
-    left = limit
-    for case, parsed in cases.items():
-        m = metadata_filter(parsed, level, keywords,
-                            entities if level != "Field" else ["FIELD"])
-        td = parsed["data"].index.to_numpy(dtype=float)
-        for r in m.itertuples(index=False):
-            vals, unit = value_and_unit(parsed["data"][r.Column_ID].to_numpy(),
-                                        r._asdict(), system, gas_display)
-            n = min(left, len(td))
-            if n == 0:
-                break
-            df = pd.DataFrame({
-                "Case": case, "Time_Days": td[:n], "Years": td[:n] / 365.25,
-                "Level": r.Level, "Entity": r.Entity, "Keyword": r.Keyword,
-                "Variable": r.Variable, "Unit": unit, "Value": vals[:n],
-            })
-            if start_date is not None:
-                df.insert(1, "Date", pd.Timestamp(start_date) + pd.to_timedelta(td[:n], unit="D"))
-            pieces.append(df)
-            left -= n
-        if left <= 0:
-            break
-    return pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
-
-
-st.title("Eclipse RSM Studio")
-st.markdown('<div class="rsm-subtitle">ECLIPSE summary analytics · Multi-case comparison · Metric / Field units · Spotfire-ready CSV</div>', unsafe_allow_html=True)
+st.title('Eclipse RSM Studio Pro')
+st.markdown('<div class="rsm-subtitle">Multi-case Eclipse summary viewer · Spotfire-style Trellis · Engineering units · Spotfire CSV</div>', unsafe_allow_html=True)
 
 with st.sidebar:
-    st.header("1 · Input cases")
-    uploads = st.file_uploader(
-        "Upload Eclipse .RSM files", type=["rsm", "txt"],
-        accept_multiple_files=True,
-        help="Upload multiple simulations together. Every file is kept as a separate named case."
-    )
-    st.header("2 · Unit settings")
-    unit_system = st.radio("Output units", ["Metric", "Field"], horizontal=True)
-    gas_display = "Mscf"
-    if unit_system == "Field":
-        gas_display = st.selectbox("Gas volume display", ["Mscf", "MMscf"])
-    st.header("3 · Time axis")
-    use_calendar = st.checkbox("Provide simulation start date", value=False,
-                               help="RSM contains elapsed days, not necessarily a calendar start date.")
-    start_date = st.date_input("Simulation DAY 0", value=date.today()) if use_calendar else None
-    axis_modes = ["Time (days)", "Years"] + (["Date"] if use_calendar else [])
-    x_mode = st.radio("Chart X axis", axis_modes, horizontal=True)
-    st.caption("Calendar dates are calculated only if you provide the correct model start date.")
+    st.header('1 · Eclipse cases')
+    uploads = st.file_uploader('Upload one or more .RSM files', type=['rsm','txt'],
+                               accept_multiple_files=True,
+                               help='Each uploaded RSM becomes a named simulation case.')
+    st.header('2 · Engineering units')
+    unit_system = st.radio('Unit system', ['Field','Metric'], horizontal=True)
+    gas_display = st.selectbox('Field gas units', ['Mscf','MMscf']) if unit_system == 'Field' else 'Mscf'
+    st.header('3 · Simulation timeline')
+    has_start = st.checkbox('Set calendar start date', value=False)
+    start_date = st.date_input('Simulation day 0', value=date.today()) if has_start else None
+    x_mode = st.radio('X-axis', ['Time (days)','Years'] + (['Date'] if has_start else []), horizontal=True)
+    st.caption('Only enter a date if you know the ECLIPSE simulation start date.')
 
 if not uploads:
-    st.info("Upload one or more Eclipse ASCII **.RSM** files using the sidebar to begin.")
-    st.markdown("""
-    **What you can do here**
-    - Compare different run cases side-by-side using original RSM filenames or custom labels.
-    - View **Field**, **Well**, and **Group** vector histories and ranked wells.
-    - Toggle between **Metric** and **Field** engineering units.
-    - Download **Long CSV**, **Wide CSV** and **Data Dictionary** for Spotfire.
-
-    This reader is designed for text-based **Eclipse RSM** exports, not binary `UNSMRY` or `SMSPEC` files.
-    """)
+    st.info('Upload Eclipse ASCII .RSM summary file(s) using the sidebar to begin.')
+    st.markdown('**Features:** Field / Well / Group profiles; multiple simultaneous vectors; '
+                'editable Oil / Gas / Water colors; Spotfire Trellis; ranking; merged Long / Wide / Dictionary CSV.')
     st.stop()
 
 cases = {}
 original_names = {}
-errors = []
+failed = []
 with st.sidebar:
-    st.header("4 · Name the cases")
-    for i, uploaded in enumerate(uploads):
-        default = Path(uploaded.name).stem
-        label = st.text_input(f"Case {i+1} · {uploaded.name}", value=default,
-                              key=f"case_{i}_{uploaded.name}").strip()
-        label = label or default
+    st.header('4 · Case labels')
+    for i, upload in enumerate(uploads):
+        default_label = Path(upload.name).stem
+        label = st.text_input(f'Case {i+1}: {upload.name}', value=default_label,
+                              key=f'casename_{i}_{upload.name}').strip() or default_label
         if label in cases:
-            label = f"{label} ({i+1})"
+            label = f'{label} ({i+1})'
         try:
-            with st.spinner(f"Parsing {uploaded.name}..."):
-                cases[label] = cached_parse(uploaded.getvalue(), uploaded.name)
-                original_names[label] = uploaded.name
+            with st.spinner(f'Parsing {upload.name}...'):
+                cases[label] = cached_parse(upload.getvalue(), upload.name)
+            original_names[label] = upload.name
         except Exception as exc:
-            errors.append(f"{uploaded.name}: {exc}")
+            failed.append(f'{upload.name}: {exc}')
 
-if errors:
-    for err in errors:
-        st.error(err)
+for error in failed:
+    st.error(error)
 if not cases:
     st.stop()
 
-meta_all = pd.concat([x["metadata"] for x in cases.values()], ignore_index=True)
-all_wells = sorted(meta_all.loc[meta_all.Level.eq("Well"), "Entity"].unique().tolist())
-all_groups = sorted(meta_all.loc[meta_all.Level.eq("Group"), "Entity"].unique().tolist())
+meta_all = pd.concat([parsed['metadata'] for parsed in cases.values()], ignore_index=True)
+levels = [x for x in ['Field','Well','Group'] if x in set(meta_all.Level)]
+all_wells = sorted(meta_all.loc[meta_all.Level.eq('Well'), 'Entity'].unique().tolist())
 
-s1, s2, s3, s4 = st.columns(4)
-s1.metric("Cases loaded", f"{len(cases)}")
-s2.metric("Unique wells", f"{len(all_wells)}")
-s3.metric("Summary keywords", f"{meta_all.Keyword.nunique()}")
-s4.metric("Longest run", f"{max(c['qc']['Time_Max_Days'] for c in cases.values()):,.0f} days")
+with st.sidebar:
+    with st.expander('5 · Plot appearance / Color Studio', expanded=False):
+        palette = {}
+        st.caption('Default engineering colors; choose any color below.')
+        palette['Oil'] = st.color_picker('Oil · Green', DEFAULT_PALETTE['Oil'])
+        palette['Water'] = st.color_picker('Water · Blue', DEFAULT_PALETTE['Water'])
+        palette['Gas'] = st.color_picker('Gas · Red', DEFAULT_PALETTE['Gas'])
+        palette['Pressure'] = st.color_picker('Pressure · Amber', DEFAULT_PALETTE['Pressure'])
+        palette['Other'] = st.color_picker('Other', DEFAULT_PALETTE['Other'])
+        theme = st.selectbox('Plot theme', ['Light','Dark'])
+        transparent = st.checkbox('Transparent plot background', value=True)
+        font_style = st.selectbox('Font style', ['Normal','Bold','Italic','Bold Italic'], index=1)
+        font_size = st.slider('Font size (pt)', min_value=10, max_value=22, value=12, step=1)
+        line_width = st.slider('Line width', min_value=1.0, max_value=5.0, value=2.5, step=0.5)
+        line_opacity = st.slider('Line opacity', min_value=0.30, max_value=1.0,
+                                 value=0.95, step=0.05)
+        area_fill = st.checkbox('Soft area fill under lines', value=False)
+        area_opacity = st.slider('Area fill opacity', min_value=0.05, max_value=0.50,
+                                 value=0.12, step=0.05) if area_fill else 0.12
+        show_grid = st.checkbox('Show subtle gridlines', value=True)
+        grid_opacity = st.slider('Grid opacity', min_value=0.0, max_value=0.50,
+                                 value=0.16, step=0.05) if show_grid else 0.0
+        distinguish_lines = st.checkbox('Different line styles for cases/wells', value=True)
+        panel_height = st.slider('Height per Trellis row (px)', min_value=220,
+                                 max_value=650, value=340, step=20)
+        chart_point_max = st.number_input('Max plotted points per curve', min_value=200,
+                                          max_value=30000, value=5000, step=200)
 
-if any(x["qc"]["Time_Mismatched_Blocks"] for x in cases.values()):
-    st.warning("One or more RSM blocks have differing TIME vectors. Blocks were merged by their numeric time values (outer join).")
+settings = {'Theme': theme, 'Transparent background': transparent, 'Font style': font_style,
+            'Font size': font_size, 'Line width': line_width, 'Line opacity': line_opacity,
+            'Area fill': area_fill, 'Area opacity': area_opacity,
+            'Show grid': show_grid, 'Grid opacity': grid_opacity,
+            'Distinguish lines': distinguish_lines, 'Panel height': panel_height,
+            'Max chart points': int(chart_point_max), 'Chart title': 'Production profiles',
+            'Color by': 'Fluid / Metric'}
 
-_tab_overview, _tab_charts, _tab_rank, _tab_data, _tab_export, _tab_qc = st.tabs([
-    "Overview", "Field & well plots", "Well ranking", "Data explorer", "Spotfire CSV export", "QC & metadata"
-])
+s1,s2,s3,s4 = st.columns(4)
+s1.metric('Loaded cases', str(len(cases)))
+s2.metric('Unique wells', f'{len(all_wells):,}')
+s3.metric('ECLIPSE keywords', str(meta_all.Keyword.nunique()))
+s4.metric('Longest simulation', f"{max(p['qc']['Time_Max_Days'] for p in cases.values()):,.0f} days")
 
-with _tab_overview:
-    st.subheader("Field summary · last available timestep")
-    main_vectors = ["FOPR", "FWPR", "FGPR", "FOPT", "FWPT", "FGPT", "FWCT", "FPR"]
+if any(p['qc']['Time_Mismatched_Blocks'] for p in cases.values()):
+    st.warning('One or more RSM blocks have different TIME values; an outer join on simulation time was used.')
+
+tab_overview,tab_plots,tab_rank,tab_data,tab_export,tab_qc = st.tabs([
+    'Overview','Interactive plots & Trellis','Well ranking','Data explorer','Spotfire export','QC & dictionary'])
+
+with tab_overview:
+    st.subheader('Field summary — last available timestep')
+    main_fields = ['FOPR','FWPR','FGPR','FOPT','FWPT','FGPT','FWCT','FPR']
     summary = []
     for case, parsed in cases.items():
-        rec = {"Case": case, "End (days)": parsed["qc"]["Time_Max_Days"]}
-        for keyword in main_vectors:
-            info = trace_data(parsed, keyword, "Field", "FIELD", unit_system, gas_display)
-            if info is None:
+        rec = {'Case': case, 'Simulation end (days)': parsed['qc']['Time_Max_Days']}
+        for kw in main_fields:
+            series = trace_data(parsed, kw, 'Field', 'FIELD', unit_system, gas_display)
+            if series is None:
                 continue
-            _, vals, unit = info
-            finite = vals[np.isfinite(vals)]
-            rec[f"{keyword} [{unit}]"] = float(finite[-1]) if len(finite) else np.nan
+            _,v,unit = series
+            finite = v[np.isfinite(v)]
+            rec[f'{kw} · {keyword_description(kw)} [{unit}]'] = float(finite[-1]) if len(finite) else np.nan
         summary.append(rec)
     st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
-    st.caption("These are **end-of-run values**, not sums across all dates. Cumulative vectors include each RSM column's printed scale factor.")
-
-    st.subheader("Field production dashboard")
-    has_fields = {s for s in meta_all.loc[meta_all.Level.eq("Field"), "Keyword"].unique()}
-    overview_pairs = [("FOPR", "Oil production rate"), ("FWPR", "Water production rate"),
-                      ("FGPR", "Gas production rate"), ("FOPT", "Cumulative oil"),
-                      ("FWCT", "Water cut"), ("FPR", "Reservoir pressure")]
-    for j in range(0, len(overview_pairs), 2):
-        cols = st.columns(2)
-        for col, (key, title) in zip(cols, overview_pairs[j:j+2]):
-            if key not in has_fields:
+    st.caption('End-of-run values (not sums over time). ECLIPSE printed ×10ⁿ scale factors are applied.')
+    st.subheader('Field production dashboard')
+    dash_keys = [('FOPR','Oil rate'),('FWPR','Water rate'),('FGPR','Gas rate'),
+                 ('FOPT','Cumulative oil'),('FWCT','Water cut'),('FPR','Average reservoir pressure')]
+    field_keys = set(meta_all.loc[meta_all.Level.eq('Field'),'Keyword'])
+    for n in range(0,len(dash_keys),2):
+        left,right = st.columns(2)
+        for col,(kw,caption) in zip((left,right),dash_keys[n:n+2]):
+            if kw not in field_keys:
                 continue
             with col:
-                fig, n = make_line_chart(cases, "Field", key, ["FIELD"],
-                                         unit_system, gas_display, x_mode, start_date,
-                                         height=315)
-                if n:
-                    fig.update_layout(title=title, margin=dict(t=68,b=45,l=58,r=10))
-                    st.plotly_chart(fig, use_container_width=True, key=f"ov_{key}")
+                records,_ = collect_plot_records(cases,'Field',[kw],['FIELD'],unit_system,gas_display)
+                opts = settings.copy()
+                opts['Chart title'] = f'{caption} · {kw}'
+                fig,count,_ = chart_factory(records,x_mode,start_date,'Field',list(cases),['FIELD'],[kw],
+                                             palette,opts)
+                fig.update_layout(height=390,margin=dict(t=85,b=105,l=55,r=50))
+                st.plotly_chart(fig,use_container_width=True,key=f'overview_{kw}',
+                                config={'displaylogo':False})
 
-with _tab_charts:
-    a, b, c = st.columns([1.1, 1.4, 1.8])
-    levels_found = [v for v in ("Field", "Well", "Group") if v in set(meta_all.Level)]
-    with a:
-        chart_level = st.selectbox("Analysis level", levels_found, key="chart_level")
-    choices = sorted(meta_all.loc[meta_all.Level.eq(chart_level), "Keyword"].unique().tolist())
-    default_key = {"Field": "FOPR", "Well": "WOPR", "Group": "GOPR"}.get(chart_level)
-    with b:
-        chart_key = st.selectbox("Eclipse keyword", choices,
-                                 index=choices.index(default_key) if default_key in choices else 0,
-                                 key=f"chart_var_{chart_level}")
-    with c:
-        chart_cases = st.multiselect("Cases", list(cases), default=list(cases), key="chart_cases")
-
-    chart_entities = ["FIELD"]
-    if chart_level in ("Well", "Group"):
-        chart_entities_available = sorted(meta_all.loc[
-            meta_all.Level.eq(chart_level) & meta_all.Keyword.eq(chart_key), "Entity"
-        ].unique().tolist())
-        chart_entities = st.multiselect(
-            f"{chart_level}s", chart_entities_available,
-            default=chart_entities_available[:4] if chart_level == "Well" else chart_entities_available,
-            key=f"entities_{chart_level}_{chart_key}"
-        )
-    pct_water = st.checkbox("Plot water cut as % (CSV retains fraction)", value=True)
-    chart_subset = {n: cases[n] for n in chart_cases}
-    if chart_subset and chart_entities:
-        fig, n = make_line_chart(chart_subset, chart_level, chart_key, chart_entities,
-                                 unit_system, gas_display, x_mode, start_date, pct_water)
-        if n:
-            st.plotly_chart(fig, use_container_width=True, key="main_chart")
-            if n >= 100:
-                st.warning("Displayed the first 100 curves to protect browser performance; narrow your well selection to view more.")
-            latest = []
-            for name, parsed in chart_subset.items():
-                for entity in chart_entities:
-                    data = trace_data(parsed, chart_key, chart_level, entity,
-                                      unit_system, gas_display)
-                    if data is None:
-                        continue
-                    td, v, unit = data
-                    finite_idx = np.where(np.isfinite(v))[0]
-                    if not len(finite_idx):
-                        continue
-                    j = finite_idx[-1]
-                    latest.append({"Case": name, "Level": chart_level, "Entity": entity,
-                                   "Keyword": chart_key, "Last_Time_Days": td[j],
-                                   "Last_Value": v[j], "Unit": unit})
-            st.markdown("**Last recorded value for each selected curve**")
-            st.dataframe(pd.DataFrame(latest), use_container_width=True, hide_index=True)
+with tab_plots:
+    st.subheader('Interactive engineering plots')
+    c1,c2,c3 = st.columns([1,2,1.5])
+    with c1:
+        chart_level = st.selectbox('Analysis level', levels, key='plot_level')
+    available_kw = sorted(meta_all.loc[meta_all.Level.eq(chart_level),'Keyword'].unique().tolist())
+    suggested = {'Field':['FOPR','FWPR','FGPR'], 'Well':['WOPR','WWPR','WGPR'],
+                 'Group':['GOPR','GWPR','GGPR']}.get(chart_level,[])
+    with c2:
+        chart_kw = st.multiselect('ECLIPSE vectors · full column names', available_kw,
+                                  default=[k for k in suggested if k in available_kw],
+                                  format_func=keyword_label,
+                                  key=f'plot_keys_{chart_level}')
+    with c3:
+        case_names = st.multiselect('Simulation cases', list(cases), default=list(cases),
+                                    key='plot_cases')
+    if chart_level == 'Field':
+        available_entities = ['FIELD']
+        entities = ['FIELD']
+    else:
+        available_entities = sorted(meta_all.loc[(meta_all.Level == chart_level) &
+                              (meta_all.Keyword.isin(chart_kw)), 'Entity'].unique().tolist())
+        entities = st.multiselect(f'{chart_level}s / entities', available_entities,
+                                  default=available_entities[:5], key=f'plot_entities_{chart_level}')
+    c4,c5,c6 = st.columns([1.2,1.4,2])
+    with c4:
+        plot_layout = st.radio('Plot layout', ['Overlay','Trellis'], horizontal=True)
+    with c5:
+        color_by = st.selectbox('Color by', ['Fluid / Metric','Case','Well / Entity','Keyword'])
+    with c6:
+        custom_title = st.text_input('Chart title', value='RSM Production Profiles')
+    settings['Chart title'] = custom_title
+    settings['Color by'] = color_by
+    percent_wct = st.checkbox('Display water cut (%) on plots — CSV exports retain fractions', value=True)
+    trellis_by = None
+    ncols,nrows,page = 1,1,1
+    subset = {c: cases[c] for c in case_names}
+    if plot_layout == 'Trellis':
+        t1,t2,t3 = st.columns(3)
+        with t1:
+            trellis_options = (['Well / Entity','Case','Keyword'] if chart_level != 'Field'
+                               else ['Case','Keyword'])
+            trellis_by = st.selectbox('Trellis by', trellis_options, key='trellis_dimension')
+        with t2:
+            ncols = st.number_input('Horizontal · plots per row',min_value=1,max_value=6,value=3,step=1)
+        with t3:
+            nrows = st.number_input('Vertical · plot rows',min_value=1,max_value=6,value=2,step=1)
+    if chart_kw and case_names and entities:
+        records,truncated = collect_plot_records(subset, chart_level, chart_kw, entities,
+                                                 unit_system,gas_display,percent_wct)
+        if records:
+            if truncated:
+                st.warning('Plot limited to the first 250 curves for responsive rendering. CSV exports are not limited.')
+            facet_values = ['ALL']
+            if trellis_by == 'Case':
+                facet_values = list(dict.fromkeys(r['case'] for r in records))
+            elif trellis_by == 'Well / Entity':
+                facet_values = list(dict.fromkeys(r['entity'] for r in records))
+            elif trellis_by == 'Keyword':
+                facet_values = list(dict.fromkeys(r['key'] for r in records))
+            total_pages = max(1,math.ceil(len(facet_values)/int(nrows*ncols)))
+            if plot_layout == 'Trellis':
+                st.caption(f'{len(facet_values)} Trellis panels · {ncols} horizontal × {nrows} vertical · {total_pages} page(s)')
+                if total_pages > 1:
+                    page = st.number_input('Trellis page',min_value=1,max_value=total_pages,
+                                           value=1,step=1,key=f'trellis_page_{trellis_by}_{ncols}_{nrows}')
+            fig,n,skipped = chart_factory(records,x_mode,start_date,chart_level,case_names,
+                                          entities,chart_kw,palette,settings,trellis_by,
+                                          int(nrows),int(ncols),int(page))
+            if skipped:
+                st.warning('A panel supports at most two different units on dual Y-axes. '
+                           f'Unplotted units: {", ".join(sorted(skipped))}. '
+                           'Use Trellis by Keyword to show all vectors separately.')
+            st.plotly_chart(fig,use_container_width=True,key='main_rsm_plot',
+                            config={'displaylogo':False,'scrollZoom':True,
+                                    'toImageButtonOptions':{'format':'png','filename':'Eclipse_RSM_Plot','scale':2}})
+            st.download_button('Download interactive Plotly chart (HTML)',
+                               data=fig.to_html(full_html=True,include_plotlyjs=True).encode('utf-8'),
+                               file_name='Eclipse_RSM_Chart.html',mime='text/html',key='download_html')
+            st.caption(f'{n} plotted lines · Lines color-coded by {color_by.lower()} · Hover to inspect values. '
+                        'Use the Plotly camera icon to export PNG.')
+            st.markdown('**Last recorded values — selected vectors**')
+            last = summarize_last(subset,chart_level,chart_kw,entities,unit_system,gas_display)
+            if not last.empty:
+                st.dataframe(last,use_container_width=True,hide_index=True,height=340)
         else:
-            st.info("No matching vectors for the selected cases/wells.")
+            st.info('No matching summary vectors exist for the current case / well selection.')
     else:
-        st.info("Choose at least one case and one entity to plot.")
+        st.info('Choose at least one case, keyword, and entity to plot.')
 
-with _tab_rank:
-    st.subheader("Well ranking at a selected simulation time")
-    well_keywords = sorted(meta_all.loc[meta_all.Level.eq("Well"), "Keyword"].unique().tolist())
-    rank_col1, rank_col2, rank_col3 = st.columns([1, 1, 1])
-    with rank_col1:
-        rank_key = st.selectbox("Ranking variable", well_keywords,
-                                index=well_keywords.index("WOPR") if "WOPR" in well_keywords else 0)
-    max_time = max(v["qc"]["Time_Max_Days"] for v in cases.values())
-    min_time = min(v["qc"]["Time_Min_Days"] for v in cases.values())
-    with rank_col2:
-        rank_day = st.slider("Simulation day", min_value=float(min_time),
-                             max_value=float(max_time), value=float(max_time),
-                             step=max(1.0, round(float(max_time - min_time) / 900)))
-    with rank_col3:
-        top_n = st.number_input("Top wells / case", min_value=1, max_value=max(1, len(all_wells)),
-                                value=min(20, max(1, len(all_wells))))
-    rows = []
-    for case, parsed in cases.items():
-        timeline = parsed["data"].index.to_numpy(dtype=float)
-        pick = int(np.abs(timeline - rank_day).argmin())
-        m = metadata_filter(parsed, "Well", [rank_key])
-        for r in m.itertuples(index=False):
-            v, unit = value_and_unit(parsed["data"][r.Column_ID].to_numpy(),
-                                     r._asdict(), unit_system, gas_display)
-            if np.isfinite(v[pick]):
-                rows.append({"Case": case, "Well": r.Entity, "Time_Days": float(timeline[pick]),
-                             "Keyword": rank_key, "Value": float(v[pick]), "Unit": unit})
-    if rows:
-        rank = pd.DataFrame(rows)
-        rank = (rank.sort_values("Value", ascending=False)
-                .groupby("Case", group_keys=False).head(int(top_n)))
-        fig = px.bar(rank, x="Well", y="Value", color="Case", barmode="group",
-                     title=f"{rank_key} · Top {top_n} wells per case",
-                     labels={"Value": f"{rank_key} ({rank.iloc[0].Unit})"},
-                     template="plotly_white", hover_data=["Time_Days"])
-        fig.update_layout(height=490, xaxis_tickangle=-45,
-                          margin=dict(t=60,b=85,l=50,r=10))
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(rank, use_container_width=True, hide_index=True)
-        st.download_button("Download well ranking CSV", rank.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"well_ranking_{rank_key}.csv", mime="text/csv")
-    else:
-        st.info("No well values are available at this time.")
-
-with _tab_data:
-    st.subheader("Tabular data explorer")
-    a, b = st.columns([1, 2])
-    with a:
-        preview_level = st.selectbox("Level", [v for v in ("Field", "Well", "Group") if v in set(meta_all.Level)], key="expl_level")
-    available = sorted(meta_all.loc[meta_all.Level.eq(preview_level), "Keyword"].unique().tolist())
-    preferred = {"Field": ["FOPR", "FWPR", "FOPT"],
-                 "Well": ["WOPR", "WWPR", "WOPT"],
-                 "Group": ["GOPR", "GWPR"]}.get(preview_level, [])
-    with b:
-        preview_keywords = st.multiselect("Variables", available,
-                                          default=[x for x in preferred if x in available],
-                                          key=f"preview_k_{preview_level}")
-    if preview_level == "Field":
-        preview_entities = ["FIELD"]
-    else:
-        options = sorted(meta_all.loc[meta_all.Level.eq(preview_level), "Entity"].unique().tolist())
-        preview_entities = st.multiselect("Entities", options,
-                                          default=options[:3], key=f"preview_ent_{preview_level}")
-    st.caption("Preview is capped at 3,000 rows. CSV export below can include the complete selected time series.")
-    if preview_keywords and preview_entities:
-        table = make_small_csv_preview(cases, preview_level, preview_keywords,
-                                       preview_entities, unit_system, gas_display,
-                                       start_date, 3000)
-        if not table.empty:
-            st.dataframe(table, use_container_width=True, hide_index=True, height=460)
+with tab_rank:
+    st.subheader('Well ranking · choose a simulation day')
+    well_kw = sorted(meta_all.loc[meta_all.Level.eq('Well'),'Keyword'].unique().tolist())
+    if well_kw:
+        col1,col2,col3 = st.columns(3)
+        with col1:
+            ranking_kw = st.selectbox('Ranking keyword',well_kw,
+                                      index=well_kw.index('WOPR') if 'WOPR' in well_kw else 0,
+                                      format_func=keyword_label)
+        lo = float(min(p['qc']['Time_Min_Days'] for p in cases.values()))
+        hi = float(max(p['qc']['Time_Max_Days'] for p in cases.values()))
+        with col2:
+            # Streamlit sliders reject a float range with an integer step.
+            # number_input uses homogeneous native float parameters and supports decimals.
+            ranking_day = st.number_input('Simulation day', min_value=lo,max_value=hi,
+                                          value=hi,step=1.0,format='%.2f')
+        with col3:
+            top_n = st.number_input('Top wells per case',min_value=1,
+                                    max_value=max(1,len(all_wells)),value=min(20,max(1,len(all_wells))),step=1)
+        data=[]
+        for case,parsed in cases.items():
+            td=parsed['data'].index.to_numpy(dtype=float)
+            ix=int(np.abs(td-ranking_day).argmin())
+            for r in metadata_filter(parsed,'Well',[ranking_kw]).itertuples(index=False):
+                v,unit=value_and_unit(parsed['data'][r.Column_ID].to_numpy(),r._asdict(),
+                                       unit_system,gas_display)
+                if np.isfinite(v[ix]):
+                    data.append({'Case':case,'Well':r.Entity,'Time_Days':float(td[ix]),
+                                 'Keyword':ranking_kw,'Column_Name':keyword_description(ranking_kw),
+                                 'Value':float(v[ix]),'Unit':unit})
+        if data:
+            ranking=pd.DataFrame(data)
+            ranking=(ranking.sort_values('Value',ascending=False)
+                    .groupby('Case',group_keys=False).head(int(top_n)))
+            fig=px.bar(ranking,x='Well',y='Value',color='Case',barmode='group',
+                       title=keyword_label(ranking_kw),template='plotly_white',
+                       labels={'Value':ranking_kw+' ('+str(ranking.iloc[0]['Unit'])+')'},
+                       hover_data=['Time_Days'])
+            fig.update_layout(height=490,xaxis_tickangle=-45,
+                              font=dict(size=font_size,family='Arial Black' if 'Bold' in font_style else 'Arial'),
+                              paper_bgcolor='rgba(0,0,0,0)' if transparent else '#FFFFFF',
+                              plot_bgcolor='rgba(0,0,0,0)' if transparent else '#FFFFFF')
+            st.plotly_chart(fig,use_container_width=True,key='ranking_bar',config={'displaylogo':False})
+            st.dataframe(ranking,use_container_width=True,hide_index=True)
+            st.download_button('Download well ranking CSV',ranking.to_csv(index=False).encode('utf-8-sig'),
+                               file_name=f'Well_Ranking_{ranking_kw}.csv',mime='text/csv')
         else:
-            st.info("No matching data.")
+            st.info('No well data available for this simulation day.')
+    else:
+        st.info('No Well-level summary vectors were detected.')
 
-with _tab_export:
-    st.subheader("Spotfire-ready merged datasets")
-    st.write("All selected cases will be **stacked into one CSV** with a `Case` column. "
-             "Use Long format for flexible Spotfire analysis and Wide format for one row per case/time/entity.")
-    st.markdown("**Example — Long CSV (recommended):**")
-    st.code("Case,Date,Time_Days,Years,Level,Entity,Variable,Keyword,Unit,Value\n"
-            "Case_A,,365,0.9993,Well,RU-019,WOPR,WOPR,STB/day,500\n"
-            "Case_B,,365,0.9993,Well,RU-019,WOPR,WOPR,STB/day,470", language="csv")
-    exp_level = st.radio("Export scope", [v for v in ("Field", "Well", "Group") if v in set(meta_all.Level)] + ["All"], horizontal=True)
-    possible = meta_all if exp_level == "All" else meta_all.loc[meta_all.Level.eq(exp_level)]
-    export_keywords = sorted(possible.Keyword.unique().tolist())
-    defaults = ["FOPR", "FWPR", "FGPR", "FOPT", "FWPT", "FGPT", "FWCT", "FPR",
-                "WOPR", "WWPR", "WGPR", "WOPT", "WWPT", "WGPT", "WWCT", "WBHP", "WTHP", "WGOR"]
-    use_all = st.checkbox(f"Select all {len(export_keywords)} keywords", value=False)
-    chosen_kw = st.multiselect("Select keywords", export_keywords,
-                               default=export_keywords if use_all else [x for x in defaults if x in export_keywords],
-                               key=f"exkw_{exp_level}_{use_all}")
-    choose_wells = []
-    if exp_level in ("Well", "All"):
-        choose_wells = st.multiselect("Optional well filter (empty = all wells)", all_wells,
-                                      default=[], key="exp_wells")
-    selection = {}
-    n_cols = 0
-    expected_rows = 0
-    for name, parsed in cases.items():
-        m = metadata_filter(parsed, exp_level, chosen_kw)
-        if choose_wells:
-            m = m.loc[(m.Level != "Well") | m.Entity.isin(choose_wells)]
-        selection[name] = m
-        n_cols += len(m)
-        expected_rows += len(parsed["data"]) * len(m)
-    st.caption(f"Selection: {len(cases)} cases · {n_cols:,} series · approximately {expected_rows:,} Long CSV rows (before null filtering).")
-    if expected_rows > 2_500_000:
-        st.warning("Large export. Reduce variables/wells if browser memory or Streamlit Cloud resources are limited.")
+with tab_data:
+    st.subheader('Tabular data explorer')
+    a,b=st.columns([1,2])
+    with a:
+        explorer_level=st.selectbox('Analysis level',levels,key='explorer_level')
+    av=sorted(meta_all.loc[meta_all.Level.eq(explorer_level),'Keyword'].unique().tolist())
+    pref={'Field':['FOPR','FWPR','FGPR','FOPT'],
+          'Well':['WOPR','WWPR','WGPR','WOPT'],
+          'Group':['GOPR','GWPR','GGPR']}.get(explorer_level,[])
+    with b:
+        explorer_kw=st.multiselect('Keyword · full name',av,
+                                   default=[k for k in pref if k in av],
+                                   format_func=keyword_label,key=f'expl_kw_{explorer_level}')
+    if explorer_level=='Field':
+        explorer_ent=['FIELD']
+    else:
+        ent_options=sorted(meta_all.loc[meta_all.Level.eq(explorer_level),'Entity'].unique().tolist())
+        explorer_ent=st.multiselect('Entities',ent_options,default=ent_options[:3],
+                                    key=f'expl_ent_{explorer_level}')
+    st.caption('Preview capped at 3,000 rows. All raw timesteps remain available in CSV export.')
+    if explorer_kw and explorer_ent:
+        tab=preview_records(cases,explorer_level,explorer_kw,explorer_ent,
+                            unit_system,gas_display,start_date)
+        if not tab.empty:
+            st.dataframe(tab,use_container_width=True,hide_index=True,height=440)
+        else:
+            st.info('No records selected.')
 
-    combined_zip = st.checkbox("Also package all 3 CSVs in one ZIP", value=True)
-    if st.button("Generate Spotfire export", type="primary", disabled=n_cols == 0):
-        with st.spinner("Writing Spotfire Long, Wide and Dictionary files..."):
-            try:
-                long_bytes = make_long_csv(cases, selection, unit_system, gas_display, start_date)
-                wide_bytes = make_wide_csv(cases, selection, unit_system, gas_display, start_date)
-                dict_bytes = make_dictionary_csv(cases, selection, unit_system, gas_display)
-                zip_bytes = b""
-                if combined_zip:
-                    mem = io.BytesIO()
-                    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED,
-                                         compresslevel=6) as z:
-                        z.writestr("RSM_Spotfire_LONG.csv", long_bytes)
-                        z.writestr("RSM_Spotfire_WIDE.csv", wide_bytes)
-                        z.writestr("RSM_Data_Dictionary.csv", dict_bytes)
-                    zip_bytes = mem.getvalue()
-                st.session_state["export_payload"] = {
-                    "long": long_bytes, "wide": wide_bytes, "dictionary": dict_bytes,
-                    "zip": zip_bytes, "config": f"{len(cases)} cases · {n_cols} series · {unit_system}"
+with tab_export:
+    st.subheader('Spotfire-ready merged datasets')
+    st.write('Selected runs are **stacked into one dataset** with `Case`, `Keyword`, '
+             '`Column_Name`, `Entity`, `Unit` and simulation time. No renaming of ECLIPSE keywords is forced.')
+    exp_level=st.radio('Data scope',levels+['All'],horizontal=True,key='export_level')
+    submeta=meta_all if exp_level=='All' else meta_all.loc[meta_all.Level.eq(exp_level)]
+    choices=sorted(submeta.Keyword.unique().tolist())
+    ex_defaults=['FOPR','FWPR','FGPR','FOPT','FWPT','FGPT','FWCT','FPR',
+                 'WOPR','WWPR','WGPR','WOPT','WWPT','WGPT','WWCT','WBHP','WTHP']
+    export_all=st.checkbox(f'Include all {len(choices)} variables',value=False)
+    export_kw=st.multiselect('Keyword / full name',choices,
+                             default=choices if export_all else [x for x in ex_defaults if x in choices],
+                             format_func=keyword_label,key=f'export_kw_{exp_level}_{export_all}')
+    export_wells=[]
+    if exp_level in ('Well','All'):
+        export_wells=st.multiselect('Optional well filter · empty = all wells',all_wells,default=[])
+    long_header_preview='Case,Date,Time_Days,Years,Level,Entity,Variable,Keyword,Column_Name,Unit,Value'
+    st.code(long_header_preview+'\nCase_A,,365,0.9993,Field,FIELD,FOPR,FOPR,Field Oil Production Rate,STB/day,1000',
+            language='csv')
+    descriptive_wide=st.checkbox('Wide CSV: include full name in column headers',value=False,
+                                  help='Off = compact ECLIPSE keyword headers. On = FOPR — Field Oil Production Rate.')
+    selection={}
+    series_count=0
+    estimated_rows=0
+    for case,parsed in cases.items():
+        m=metadata_filter(parsed,exp_level,export_kw)
+        if export_wells:
+            m=m.loc[(m.Level!='Well')|m.Entity.isin(export_wells)]
+        selection[case]=m
+        series_count+=len(m)
+        estimated_rows+=len(parsed['data'])*len(m)
+    st.caption(f'{len(cases)} cases · {series_count:,} vectors · up to {estimated_rows:,} Long CSV rows before null filtering.')
+    if estimated_rows>2_500_000:
+        st.warning('Large dataset. Streamlit Cloud memory can be limited. Reduce keyword or well selections if needed.')
+    export_zip=st.checkbox('Combine Long, Wide and Dictionary CSV in a ZIP',value=True)
+    if st.button('Generate Spotfire exports',type='primary',disabled=series_count==0):
+        try:
+            with st.spinner('Building all-case CSV files...'):
+                long_bytes=make_long_csv(cases,selection,unit_system,gas_display,start_date)
+                wide_bytes=make_wide_csv(cases,selection,unit_system,gas_display,start_date,
+                                         descriptive_headers=descriptive_wide)
+                dict_bytes=make_dictionary_csv(cases,selection,unit_system,gas_display)
+                zbytes=b''
+                if export_zip:
+                    memory=io.BytesIO()
+                    with zipfile.ZipFile(memory,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+                        z.writestr('RSM_Spotfire_LONG.csv',long_bytes)
+                        z.writestr('RSM_Spotfire_WIDE.csv',wide_bytes)
+                        z.writestr('RSM_Data_Dictionary.csv',dict_bytes)
+                    zbytes=memory.getvalue()
+                st.session_state['export_payload_v2']={
+                    'long':long_bytes,'wide':wide_bytes,'dictionary':dict_bytes,'zip':zbytes,
+                    'description':f'{len(cases)} cases · {series_count:,} vectors · {unit_system}',
                 }
-            except Exception as ex:
-                st.error(f"Export failed: {ex}")
-                st.session_state.pop("export_payload", None)
-    payload = st.session_state.get("export_payload")
+        except Exception as exc:
+            st.session_state.pop('export_payload_v2',None)
+            st.error(f'CSV generation failed: {exc}')
+    payload=st.session_state.get('export_payload_v2')
     if payload:
-        st.success(f"CSV files generated: {payload['config']}.")
-        d1, d2, d3, d4 = st.columns(4)
+        st.success('Generated: '+payload['description'])
+        d1,d2,d3,d4=st.columns(4)
         with d1:
-            st.download_button("Download Long CSV", payload["long"],
-                               file_name="RSM_Spotfire_LONG.csv", mime="text/csv")
+            st.download_button('Long CSV',payload['long'],file_name='RSM_Spotfire_LONG.csv',mime='text/csv')
         with d2:
-            st.download_button("Download Wide CSV", payload["wide"],
-                               file_name="RSM_Spotfire_WIDE.csv", mime="text/csv")
+            st.download_button('Wide CSV',payload['wide'],file_name='RSM_Spotfire_WIDE.csv',mime='text/csv')
         with d3:
-            st.download_button("Download Dictionary", payload["dictionary"],
-                               file_name="RSM_Data_Dictionary.csv", mime="text/csv")
+            st.download_button('Data Dictionary',payload['dictionary'],file_name='RSM_Data_Dictionary.csv',mime='text/csv')
         with d4:
-            if payload["zip"]:
-                st.download_button("Download all as ZIP", payload["zip"],
-                                   file_name="RSM_Spotfire_Exports.zip", mime="application/zip")
-        st.caption("Downloaded files reflect the selections used when you last clicked Generate. Click Generate again after changing filters.")
+            if payload['zip']:
+                st.download_button('All three — ZIP',payload['zip'],file_name='RSM_Spotfire_Exports.zip',
+                                   mime='application/zip')
+        st.caption('Re-generate after changing units, cases or export filters.')
 
-with _tab_qc:
-    st.subheader("Quality checks for each run")
-    qc = []
-    for case, parsed in cases.items():
-        q = parsed["qc"]
-        qc.append({"Case": case, "Filename": original_names[case], "Blocks": q["Blocks"],
-                   "TimeSteps": q["Time_Steps"], "Vectors": q["Columns"],
-                   "Keywords": q["Unique_Keywords"], "Wells": q["Wells"],
-                   "ScaledColumns": q["Scaled_Columns"],
-                   "MisalignedBlocks": q["Time_Mismatched_Blocks"],
-                   "NonNumericCells": q["NonNumeric_Data_Cells"],
-                   "StartDays": q["Time_Min_Days"], "EndDays": q["Time_Max_Days"]})
-    st.dataframe(pd.DataFrame(qc), use_container_width=True, hide_index=True)
-    st.caption("NonNumericCells counts non-empty values that could not be interpreted as numbers; blank cells remain missing, not zero.")
-
-    st.subheader("Field versus sum of wells · end-of-run reconciliation")
-    st.caption("Independent QC: compare simulator field totals against the same variables summed for all exported wells at each case's last simulation day.")
-    recon = []
-    counterparts = [("FOPR", "WOPR"), ("FWPR", "WWPR"),
-                    ("FGPR", "WGPR"), ("FOPT", "WOPT"),
-                    ("FWPT", "WWPT"), ("FGPT", "WGPT")]
-    for case, parsed in cases.items():
-        for field_key, well_key in counterparts:
-            fm = metadata_filter(parsed, "Field", [field_key])
-            wm = metadata_filter(parsed, "Well", [well_key])
+with tab_qc:
+    st.subheader('ECLIPSE run quality checks')
+    qc=[]
+    for case,parsed in cases.items():
+        q=parsed['qc']
+        qc.append({'Case':case,'RSM Filename':original_names[case],
+                   'Blocks':q['Blocks'],'Timesteps':q['Time_Steps'],
+                   'Vectors':q['Columns'],'Keywords':q['Unique_Keywords'],
+                   'Wells':q['Wells'],'Scaled vectors':q['Scaled_Columns'],
+                   'Mismatched time blocks':q['Time_Mismatched_Blocks'],
+                   'Invalid numeric cells':q['NonNumeric_Data_Cells'],
+                   'Start day':q['Time_Min_Days'],'End day':q['Time_Max_Days']})
+    st.dataframe(pd.DataFrame(qc),use_container_width=True,hide_index=True)
+    st.subheader('Field production versus summed wells')
+    reconc=[]
+    for case,parsed in cases.items():
+        for fk,wk in [('FOPR','WOPR'),('FWPR','WWPR'),('FGPR','WGPR'),
+                      ('FOPT','WOPT'),('FWPT','WWPT'),('FGPT','WGPT')]:
+            fm=metadata_filter(parsed,'Field',[fk])
+            wm=metadata_filter(parsed,'Well',[wk])
             if fm.empty or wm.empty:
                 continue
-            f, u = value_and_unit(parsed["data"][fm.iloc[0].Column_ID].to_numpy(),
-                                  fm.iloc[0], unit_system, gas_display)
-            field_value = float(f[-1])
-            well_total = 0.0
+            f,unit=value_and_unit(parsed['data'][fm.iloc[0].Column_ID].to_numpy(),
+                                  fm.iloc[0],unit_system,gas_display)
+            if not np.isfinite(f[-1]):
+                continue
+            sum_wells=0.0
             for r in wm.itertuples(index=False):
-                v, _ = value_and_unit(parsed["data"][r.Column_ID].to_numpy(),
-                                      r._asdict(), unit_system, gas_display)
-                if np.isfinite(v[-1]):
-                    well_total += float(v[-1])
-            diff_pct = 100.0 * (well_total - field_value) / abs(field_value) if field_value else np.nan
-            recon.append({"Case": case, "Field_Vector": field_key,
-                          "Well_Vector": well_key, "Field_Value": field_value,
-                          "Sum_Wells": well_total, "Unit": u,
-                          "Difference_%": diff_pct})
-    if recon:
-        st.dataframe(pd.DataFrame(recon), use_container_width=True, hide_index=True)
-        st.caption("Minor discrepancies are expected due to printed RSM rounding; material gaps may indicate omitted/inconsistent summary vectors.")
-    st.subheader("Variable dictionary and source scale")
-    meta_sample = []
-    unsupported = set()
-    for name, parsed in cases.items():
-        m = parsed["metadata"].copy()
-        m.insert(0, "Case", name)
-        m["Export_Unit"] = [
-            _target_conversion(r.Keyword, r.Source_Unit, unit_system, gas_display)[1]
-            for r in m.itertuples(index=False)
-        ]
+                w,_=value_and_unit(parsed['data'][r.Column_ID].to_numpy(),r._asdict(),
+                                   unit_system,gas_display)
+                if np.isfinite(w[-1]):
+                    sum_wells+=float(w[-1])
+            pct=100*(sum_wells-float(f[-1]))/abs(float(f[-1])) if f[-1] else np.nan
+            reconc.append({'Case':case,'Field keyword':fk,'Well keyword':wk,
+                            'Column_Name':keyword_description(fk),
+                            'Field total':float(f[-1]),'Sum of wells':sum_wells,
+                            'Difference %':pct,'Unit':unit})
+    if reconc:
+        st.dataframe(pd.DataFrame(reconc),use_container_width=True,hide_index=True)
+        st.caption('Minor rounding differences are normal; missing well vectors can cause material gaps.')
+    st.subheader('Keyword dictionary · RSM source scaling')
+    dic=[]
+    unsupported=[]
+    for case,parsed in cases.items():
+        m=parsed['metadata'].copy()
+        m.insert(0,'Case',case)
+        m.insert(m.columns.get_loc('Keyword')+1,'Column_Name',m.Keyword.map(keyword_description))
+        m['Export_Unit']=[_target_conversion(r.Keyword,r.Source_Unit,unit_system,gas_display)[1]
+                           for r in m.itertuples(index=False)]
         for r in m.itertuples(index=False):
-            _, _, supported = _target_conversion(r.Keyword, r.Source_Unit,
-                                                 unit_system, gas_display)
-            if not supported:
-                unsupported.add((r.Keyword, r.Source_Unit))
-        meta_sample.append(m)
-    metadata_out = pd.concat(meta_sample, ignore_index=True)
-    st.dataframe(metadata_out, use_container_width=True, hide_index=True, height=380)
+            _,_,ok=_target_conversion(r.Keyword,r.Source_Unit,unit_system,gas_display)
+            if not ok:
+                unsupported.append((r.Keyword,r.Source_Unit))
+        dic.append(m)
+        if parsed['qc']['Issues']:
+            st.warning(f"{case}: "+'; '.join(parsed['qc']['Issues'][:10]))
+    st.dataframe(pd.concat(dic,ignore_index=True),use_container_width=True,hide_index=True,height=410)
     if unsupported:
-        st.warning("Unrecognized or dimensionless source units are preserved without forced conversion: " +
-                   ", ".join(f"{kw} [{unit or 'blank'}]" for kw, unit in sorted(unsupported)[:25]))
-    else:
-        st.success("All recognized vectors have supported unit metadata or a dimensionless type.")
-    for case, parsed in cases.items():
-        if parsed["qc"]["Issues"]:
-            st.warning(f"{case}: " + "; ".join(parsed["qc"]["Issues"][:20]))
-    st.caption("NOTE: RSM column scaling and unit conversions are applied to displayed/exported values; original unscaled numbers remain available in memory for reliable re-conversion.")
+        st.warning('Unit conversions not recognized — values preserved: '+
+                   ', '.join(f'{k} [{u}]' for k,u in sorted(set(unsupported))[:25]))
+    st.caption('Original RSM scaling and source units are preserved as metadata. Unknown keywords receive neutral labels.')
