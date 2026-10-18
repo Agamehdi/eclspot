@@ -675,7 +675,7 @@ def chart_factory(records, mode, start_date, level, cases, entities, keywords,
     fig.update_layout(
         template='plotly_dark' if is_dark else 'plotly_white',
         title=dict(text=style_markup(settings['Chart title'], settings['Font style']),
-                   x=0.015, xanchor='left', font=dict(size=settings['Font size']+5)),
+                   x=0.015, xanchor='center', font=dict(size=settings['Font size']+5)),
         font=dict(family=font_family, size=settings['Font size'], color=base_text),
         paper_bgcolor=paper, plot_bgcolor=plot,
         height=max(360, settings['Panel height']*rows_used+150),
