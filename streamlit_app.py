@@ -679,9 +679,13 @@ def chart_factory(records, mode, start_date, level, cases, entities, keywords,
         font=dict(family=font_family, size=settings['Font size'], color=base_text),
         paper_bgcolor=paper, plot_bgcolor=plot,
         height=max(360, settings['Panel height']*rows_used+150),
-        margin=dict(t=100 if is_trellis else 90, b=115, l=65, r=65),
-        legend=dict(orientation='h', yanchor='top', y=-0.16, xanchor='left', x=0,
+ #       margin=dict(t=100 if is_trellis else 90, b=115, l=65, r=65),
+ #       legend=dict(orientation='h', yanchor='top', y=-0.16, xanchor='left', x=0,
                     bgcolor='rgba(0,0,0,0)', font=dict(size=max(9,settings['Font size']-1))),
+
+        margin=dict( t=100,b=190,l=65,r=65),
+        legend=dict(orientation='h',yanchor='top',y=-0.20,xanchor='center',x=0.5,bgcolor='rgba(0,0,0,0)',font=dict(size=11)),
+        
         hovermode='closest' if is_trellis else 'x unified',
     )
     fig.update_xaxes(showgrid=settings['Show grid'], gridcolor=grid,
