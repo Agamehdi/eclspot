@@ -578,8 +578,17 @@ def plot_color(rec, color_by, palette, cases, entities, keywords):
 
 
 def chart_factory(records, mode, start_date, level, cases, entities, keywords,
-                  palette, settings, trellis_by=None, nrows=1, ncols=1, page=1):
-    """Overlay or paged Spotfire-like Trellis, with at most two axes per panel."""
+                  palette, settings, trellis_by=None, nrows=1, ncols=1, page=1,
+                  render_backend='webgl'):
+    """Overlay or paged Trellis with at most two axes per panel.
+
+    SVG is used for Overview charts. Inactive Streamlit tabs remain mounted,
+    and many Scattergl figures can exhaust browser WebGL contexts after
+    viewing Trellis charts, leaving visible axes but invisible data curves.
+    """
+    if render_backend not in ('webgl', 'svg'):
+        raise ValueError("render_backend must be 'webgl' or 'svg'")
+    scatter_type = go.Scatter if render_backend == 'svg' else go.Scattergl
     facets = ['ALL']
     if trellis_by == 'Case':
         facets = list(dict.fromkeys(r['case'] for r in records))
@@ -638,7 +647,7 @@ def chart_factory(records, mode, start_date, level, cases, entities, keywords,
             if len(y) > settings['Max chart points']:
                 keep = np.unique(np.linspace(0, len(y)-1, settings['Max chart points'], dtype=int))
                 x, y = x[keep], y[keep]
-            trace = go.Scattergl(
+            trace = scatter_type(
                 x=x, y=y, mode='lines', name=name,
                 legendgroup=name, showlegend=name not in seen_legends,
                 line=dict(color=rgba_from_hex(color, settings['Line opacity']),
@@ -675,17 +684,13 @@ def chart_factory(records, mode, start_date, level, cases, entities, keywords,
     fig.update_layout(
         template='plotly_dark' if is_dark else 'plotly_white',
         title=dict(text=style_markup(settings['Chart title'], settings['Font style']),
-                   x=0.015, xanchor='center', font=dict(size=settings['Font size']+5)),
+                   x=0.015, xanchor='left', font=dict(size=settings['Font size']+5)),
         font=dict(family=font_family, size=settings['Font size'], color=base_text),
         paper_bgcolor=paper, plot_bgcolor=plot,
         height=max(360, settings['Panel height']*rows_used+150),
- #       margin=dict(t=100 if is_trellis else 90, b=115, l=65, r=65),
- #       legend=dict(orientation='h', yanchor='top', y=-0.16, xanchor='left', x=0,
- #                   bgcolor='rgba(0,0,0,0)', font=dict(size=max(9,settings['Font size']-1))),
-
-        margin=dict( t=100,b=190,l=65,r=65),
-        legend=dict(orientation='h',yanchor='top',y=-0.20,xanchor='center',x=0.5,bgcolor='rgba(0,0,0,0)',font=dict(size=11)),
-        
+        margin=dict(t=95 if is_trellis else 85, b=115, l=65, r=65),
+        legend=dict(orientation='h', yanchor='top', y=-0.16, xanchor='left', x=0,
+                    bgcolor='rgba(0,0,0,0)', font=dict(size=max(9,settings['Font size']-1))),
         hovermode='closest' if is_trellis else 'x unified',
     )
     fig.update_xaxes(showgrid=settings['Show grid'], gridcolor=grid,
@@ -884,14 +889,37 @@ with tab_overview:
             if kw not in field_keys:
                 continue
             with col:
+                # A native Streamlit heading stays visible when hidden tabs
+                # resize; Plotly's in-figure title could become clipped.
+                st.markdown(f'#### {caption} · {kw}')
                 records,_ = collect_plot_records(cases,'Field',[kw],['FIELD'],unit_system,gas_display)
                 opts = settings.copy()
                 opts['Chart title'] = f'{caption} · {kw}'
-                fig,count,_ = chart_factory(records,x_mode,start_date,'Field',list(cases),['FIELD'],[kw],
-                                             palette,opts)
-                fig.update_layout(height=390,margin=dict(t=85,b=105,l=55,r=50))
-                st.plotly_chart(fig,use_container_width=True,key=f'overview_{kw}',
-                                config={'displaylogo':False})
+                fig,count,_ = chart_factory(
+                    records,x_mode,start_date,'Field',list(cases),['FIELD'],[kw],
+                    palette,opts,render_backend='svg'
+                )
+                # SVG curves survive WebGL context exhaustion after visiting
+                # heavy Plotly Trellis pages. Place legend clear of x-axis.
+                fig.update_layout(
+                    title=None,
+                    height=440,
+                    autosize=True,
+                    margin=dict(t=20,b=155,l=65,r=40),
+                    legend=dict(
+                        orientation='h',
+                        x=0.5,xanchor='center',y=-0.33,yanchor='top',
+                        bgcolor='rgba(0,0,0,0)',
+                        font=dict(size=max(9,settings['Font size']-1)),
+                    ),
+                    uirevision=False,
+                )
+                fig.update_xaxes(automargin=True)
+                fig.update_yaxes(automargin=True)
+                st.plotly_chart(
+                    fig,use_container_width=True,key=f'overview_{kw}',
+                    config={'displaylogo':False,'responsive':True},
+                )
 
 with tab_plots:
     st.subheader('Interactive engineering plots')
