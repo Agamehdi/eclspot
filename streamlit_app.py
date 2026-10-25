@@ -489,6 +489,119 @@ import streamlit as st
 
 st.set_page_config(page_title='Eclipse RSM Studio Pro', page_icon='📊', layout='wide')
 
+# ---- Design template (JSON only; RSM files are never embedded) ----
+import hashlib
+import json
+from datetime import datetime
+
+PROFILE_VERSION = 1
+_PROFILE_EXACT_KEYS = {
+    'plot_level', 'plot_cases', 'trellis_dimension', 'explorer_level',
+    'export_level',
+}
+_PROFILE_KEY_PREFIXES = (
+    'rsm_', 'casename_', 'plot_keys_', 'plot_entities_','plot_cases',
+    'expl_kw_', 'expl_ent_', 'export_kw_', 'trellis_page_',
+)
+
+
+def _profile_key_allowed(key: str) -> bool:
+    return (key in _PROFILE_EXACT_KEYS or
+            key.startswith(_PROFILE_KEY_PREFIXES)) and not key.startswith('rsm_template_')
+
+
+def _template_serializable(value):
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, tuple):
+        return [_template_serializable(v) for v in value]
+    if isinstance(value, list):
+        return [_template_serializable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    raise TypeError(f'Unsupported profile widget value type: {type(value).__name__}')
+
+
+def restore_key(key, options=None, multi=False, minimum=None, maximum=None, as_date=False):
+    """Restore a saved choice immediately before this specific widget is instantiated.
+
+    Delayed per-widget hydration works even when the template is loaded before
+    the RSM files are re-uploaded, and filters selections not present in new runs.
+    """
+    stored = st.session_state.get('_rsm_profile_saved_values', {})
+    applied = st.session_state.setdefault('_rsm_profile_applied', set())
+    if key not in applied and key in stored:
+        value = stored[key]
+        try:
+            if as_date:
+                value = date.fromisoformat(value) if isinstance(value, str) else value
+            if multi:
+                value = [v for v in value if options is None or v in options]
+            elif options is not None and value not in options:
+                value = None
+            if minimum is not None and value is not None and not isinstance(value, (list, dict)):
+                value = max(minimum, value)
+            if maximum is not None and value is not None and not isinstance(value, (list, dict)):
+                value = min(maximum, value)
+            if value is not None:
+                st.session_state[key] = value
+        except (ValueError, TypeError, OverflowError):
+            pass
+        applied.add(key)
+    return key
+
+
+def download_profile_json(case_names, source_names):
+    values = {}
+    for key, value in st.session_state.items():
+        if _profile_key_allowed(key) and key not in ('rsm_rsm_uploader', 'rsm_template_download') and not key.startswith('rsm_download_'):
+            try:
+                values[key] = _template_serializable(value)
+            except (TypeError, ValueError):
+                continue
+    data = {
+        'application': 'Eclipse RSM Studio Pro',
+        'template_version': PROFILE_VERSION,
+        'created_utc': datetime.now().astimezone().isoformat(),
+        'case_labels': list(case_names),
+        'original_rsm_filenames': list(source_names),
+        'includes_rsm_data': False,
+        'widget_states': values,
+    }
+    return json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8')
+
+
+def handle_profile_upload(uploaded):
+    if uploaded is None:
+        return
+    raw = uploaded.getvalue()
+    fingerprint = hashlib.sha256(raw).hexdigest()
+    if st.session_state.get('_rsm_profile_loaded_hash') == fingerprint:
+        return
+    try:
+        if len(raw) > 1_000_000:
+            raise ValueError('JSON template file is too large (1 MB limit).')
+        data = json.loads(raw.decode('utf-8-sig'))
+        if not isinstance(data, dict) or data.get('application') != 'Eclipse RSM Studio Pro':
+            raise ValueError('This is not an Eclipse RSM Studio Pro template.')
+        if data.get('template_version') != PROFILE_VERSION:
+            raise ValueError('Unsupported template version.')
+        values = data.get('widget_states')
+        if not isinstance(values, dict):
+            raise ValueError('Missing widget settings in template.')
+        st.session_state['_rsm_profile_saved_values'] = {
+            k: v for k, v in values.items() if isinstance(k, str) and _profile_key_allowed(k)
+        }
+        st.session_state['_rsm_profile_applied'] = set()
+        st.session_state['_rsm_profile_loaded_hash'] = fingerprint
+        st.session_state['_rsm_profile_source_files'] = data.get('original_rsm_filenames', [])
+        st.session_state['_rsm_profile_loaded_name'] = uploaded.name
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+        st.sidebar.error(f'Cannot load design template: {exc}')
+
+
 DEFAULT_PALETTE = {
     'Oil': '#16A34A', 'Gas': '#DC2626', 'Water': '#2563EB',
     'Pressure': '#D97706', 'Other': '#7C3AED',
@@ -754,6 +867,104 @@ def cached_parse(raw: bytes, filename: str):
     return parse_rsm(raw, filename)
 
 
+
+
+def _field_curve(parsed, keyword, system, gas_display):
+    return trace_data(parsed, keyword, 'Field', 'FIELD', system, gas_display)
+
+
+def _volume_detail(parsed, system, gas_display, manual_stoiip=None):
+    """Volumes come only from documented RSM vectors, not rate integration.
+
+    FOPT is cumulative produced oil; FOIP is oil currently in place. At the
+    earliest RSM time, FOIP is a proxy for initial STOIIP only if this sample
+    is truly the model's initial state. FOE is ECLIPSE oil recovery efficiency.
+    """
+    t = parsed['data'].index.to_numpy(dtype=float)
+    opt = _field_curve(parsed, 'FOPT', system, gas_display)
+    oip = _field_curve(parsed, 'FOIP', system, gas_display)
+    oe = _field_curve(parsed, 'FOE', system, gas_display)
+    unit = opt[2] if opt is not None else (oip[2] if oip is not None else ('STB' if system == 'Field' else 'Sm3'))
+    prod = np.asarray(opt[1], dtype=float) if opt else np.full(len(t),np.nan)
+    oil_in_place = np.asarray(oip[1], dtype=float) if oip else np.full(len(t),np.nan)
+    efficiency = np.asarray(oe[1], dtype=float) if oe else np.full(len(t),np.nan)
+    finite_oip = np.flatnonzero(np.isfinite(oil_in_place) & (oil_in_place > 0))
+    finite_prod = np.flatnonzero(np.isfinite(prod))
+    finite_eff = np.flatnonzero(np.isfinite(efficiency))
+    notes = []
+    initial = np.nan
+    source = 'Unavailable'
+    if manual_stoiip is not None and np.isfinite(manual_stoiip) and manual_stoiip > 0:
+        initial = float(manual_stoiip)
+        source = 'User-specified STOIIP'
+    elif len(finite_oip):
+        initial = float(oil_in_place[finite_oip[0]])
+        source = 'FOIP at first available timestep'
+        if t[finite_oip[0]] > 0.01:
+            notes.append('FOIP first available after simulation day zero: initial STOIIP may be understated.')
+    elif len(finite_eff) and len(finite_prod):
+        # FOE = FOPT / OOIP; an explicit fallback only when both summary
+        # vectors are available at the SAME timestep.
+        valid = np.flatnonzero(np.isfinite(prod) & np.isfinite(efficiency) &
+                               (prod >= 0) & (efficiency > 1e-9) & (efficiency <= 1.0))
+        if len(valid):
+            initial = float(prod[valid[-1]] / efficiency[valid[-1]])
+            source = 'Inferred from FOPT / FOE'
+            notes.append('Inferred STOIIP assumes FOE is a fraction and consistent with FOPT.')
+    if manual_stoiip is not None and manual_stoiip <= 0:
+        notes.append('Manual STOIIP must be greater than zero.')
+    if not len(finite_prod):
+        notes.append('FOPT unavailable: produced/recovered oil volume cannot be calculated.')
+    recovered = float(prod[finite_prod[-1]]) if len(finite_prod) else np.nan
+    if np.isfinite(initial) and initial > 0:
+        rf_curve = 100 * prod / initial
+        rf_final = 100 * recovered / initial if np.isfinite(recovered) else np.nan
+        rf_source = 'FOPT / STOIIP'
+        if np.isfinite(rf_final) and rf_final > 100.1:
+            notes.append('Calculated RF exceeds 100%; validate FOIP/FOE/FOPT definitions and start time.')
+    elif len(finite_eff):
+        rf_curve = 100 * efficiency
+        rf_final = float(rf_curve[finite_eff[-1]])
+        rf_source = 'FOE direct'
+    else:
+        rf_curve = np.full(len(t),np.nan)
+        rf_final = np.nan
+        rf_source = 'Unavailable'
+    return {
+        'days': t, 'unit': unit, 'initial': initial,
+        'recovered': recovered, 'rf_final': rf_final, 'rf_curve': rf_curve,
+        'produced_curve': prod, 'foip_curve': oil_in_place,
+        'initial_source': source, 'rf_source': rf_source, 'notes': notes,
+    }
+
+
+def _pretty_volume(value, unit):
+    if not np.isfinite(value):
+        return 'N/A'
+    short = 'MMSTB' if unit.upper() == 'STB' else 'million Sm³'
+    return f'{value / 1e6:,.2f} {short}'
+
+
+def _volume_figure_style(fig, name, palette_settings, y_title=None):
+    dark = palette_settings['Theme'] == 'Dark'
+    clear = palette_settings['Transparent background']
+    paper = 'rgba(0,0,0,0)' if clear else ('#0F172A' if dark else '#FFFFFF')
+    plot = 'rgba(0,0,0,0)' if clear else ('#111827' if dark else '#FFFFFF')
+    text_color = '#E2E8F0' if dark and not clear else '#334155'
+    fig.update_layout(
+        title=None, template='plotly_dark' if dark else 'plotly_white',
+        height=440, paper_bgcolor=paper, plot_bgcolor=plot,
+        margin=dict(t=25, b=135, l=75, r=35),
+        font=dict(size=palette_settings['Font size'], color=text_color,
+                  family=('Arial Black, Arial' if 'Bold' in palette_settings['Font style']
+                          else 'Georgia' if 'Italic' in palette_settings['Font style'] else 'Arial')),
+        legend=dict(orientation='h', x=0.5, xanchor='center', y=-0.29, yanchor='top'),
+        hovermode='x unified'
+    )
+    fig.update_xaxes(showgrid=palette_settings['Show grid'], automargin=True)
+    fig.update_yaxes(title_text=y_title,showgrid=palette_settings['Show grid'],automargin=True)
+    return fig
+
 st.markdown('''
 <style>
 .block-container {padding-top: 1.2rem; max-width: 1750px;}
@@ -769,17 +980,36 @@ st.title('Eclipse RSM Studio Pro')
 st.markdown('<div class="rsm-subtitle">Multi-case Eclipse summary viewer · Spotfire-style Trellis · Engineering units · Spotfire CSV</div>', unsafe_allow_html=True)
 
 with st.sidebar:
+    with st.expander('0 · Save / load design template', expanded=True):
+        template_upload = st.file_uploader(
+            'Load saved design (.json)', type=['json'], key='rsm_template_uploader',
+            help='Restores filters, display preferences and selected cases; upload your RSM files separately.'
+        )
+        handle_profile_upload(template_upload)
+        if st.session_state.get('_rsm_profile_loaded_name'):
+            st.success('Loaded template: ' + st.session_state['_rsm_profile_loaded_name'])
+        st.caption('After configuring the dashboard, download your JSON template below. '
+                   'JSON contains settings, not simulation data.')
+
+with st.sidebar:
     st.header('1 · Eclipse cases')
     uploads = st.file_uploader('Upload one or more .RSM files', type=['rsm','txt'],
                                accept_multiple_files=True,
-                               help='Each uploaded RSM becomes a named simulation case.')
+                               help='Each uploaded RSM becomes a named simulation case.',
+                               key='rsm_rsm_uploader')
     st.header('2 · Engineering units')
-    unit_system = st.radio('Unit system', ['Field','Metric'], horizontal=True)
-    gas_display = st.selectbox('Field gas units', ['Mscf','MMscf']) if unit_system == 'Field' else 'Mscf'
+    unit_system = st.radio('Unit system', ['Field','Metric'], horizontal=True,
+                           key=restore_key('rsm_unit_system', ['Field','Metric']))
+    gas_display = st.selectbox('Field gas units', ['Mscf','MMscf'],
+                               key=restore_key('rsm_gas_display', ['Mscf','MMscf'])) if unit_system == 'Field' else 'Mscf'
     st.header('3 · Simulation timeline')
-    has_start = st.checkbox('Set calendar start date', value=False)
-    start_date = st.date_input('Simulation day 0', value=date.today()) if has_start else None
-    x_mode = st.radio('X-axis', ['Time (days)','Years'] + (['Date'] if has_start else []), horizontal=True)
+    has_start = st.checkbox('Set calendar start date', value=False,
+                            key=restore_key('rsm_has_start'))
+    start_date = st.date_input('Simulation day 0', value=date.today(),
+                               key=restore_key('rsm_start_date', as_date=True)) if has_start else None
+    x_options = ['Time (days)','Years'] + (['Date'] if has_start else [])
+    x_mode = st.radio('X-axis', x_options, horizontal=True,
+                      key=restore_key('rsm_x_mode', x_options))
     st.caption('Only enter a date if you know the ECLIPSE simulation start date.')
 
 if not uploads:
@@ -796,7 +1026,7 @@ with st.sidebar:
     for i, upload in enumerate(uploads):
         default_label = Path(upload.name).stem
         label = st.text_input(f'Case {i+1}: {upload.name}', value=default_label,
-                              key=f'casename_{i}_{upload.name}').strip() or default_label
+                              key=restore_key(f'casename_{i}_{upload.name}')).strip() or default_label
         if label in cases:
             label = f'{label} ({i+1})'
         try:
@@ -819,29 +1049,29 @@ with st.sidebar:
     with st.expander('5 · Plot appearance / Color Studio', expanded=False):
         palette = {}
         st.caption('Default engineering colors; choose any color below.')
-        palette['Oil'] = st.color_picker('Oil · Green', DEFAULT_PALETTE['Oil'])
-        palette['Water'] = st.color_picker('Water · Blue', DEFAULT_PALETTE['Water'])
-        palette['Gas'] = st.color_picker('Gas · Red', DEFAULT_PALETTE['Gas'])
-        palette['Pressure'] = st.color_picker('Pressure · Amber', DEFAULT_PALETTE['Pressure'])
-        palette['Other'] = st.color_picker('Other', DEFAULT_PALETTE['Other'])
-        theme = st.selectbox('Plot theme', ['Light','Dark'])
-        transparent = st.checkbox('Transparent plot background', value=True)
-        font_style = st.selectbox('Font style', ['Normal','Bold','Italic','Bold Italic'], index=1)
-        font_size = st.slider('Font size (pt)', min_value=10, max_value=22, value=12, step=1)
-        line_width = st.slider('Line width', min_value=1.0, max_value=5.0, value=2.5, step=0.5)
+        palette['Oil'] = st.color_picker('Oil · Green', DEFAULT_PALETTE['Oil'], key=restore_key('rsm_color_oil'))
+        palette['Water'] = st.color_picker('Water · Blue', DEFAULT_PALETTE['Water'], key=restore_key('rsm_color_water'))
+        palette['Gas'] = st.color_picker('Gas · Red', DEFAULT_PALETTE['Gas'], key=restore_key('rsm_color_gas'))
+        palette['Pressure'] = st.color_picker('Pressure · Amber', DEFAULT_PALETTE['Pressure'], key=restore_key('rsm_color_pressure'))
+        palette['Other'] = st.color_picker('Other', DEFAULT_PALETTE['Other'], key=restore_key('rsm_color_other'))
+        theme = st.selectbox('Plot theme', ['Light','Dark'], key=restore_key('rsm_theme',['Light','Dark']))
+        transparent = st.checkbox('Transparent plot background', value=True, key=restore_key('rsm_transparent'))
+        font_style = st.selectbox('Font style', ['Normal','Bold','Italic','Bold Italic'], index=1, key=restore_key('rsm_font_style',['Normal','Bold','Italic','Bold Italic']))
+        font_size = st.slider('Font size (pt)', min_value=10, max_value=22, value=12, step=1, key=restore_key('rsm_font_size', minimum=10, maximum=22))
+        line_width = st.slider('Line width', min_value=1.0, max_value=5.0, value=2.5, step=0.5, key=restore_key('rsm_line_width', minimum=1.0,maximum=5.0))
         line_opacity = st.slider('Line opacity', min_value=0.30, max_value=1.0,
-                                 value=0.95, step=0.05)
-        area_fill = st.checkbox('Soft area fill under lines', value=False)
+                                 value=0.95, step=0.05, key=restore_key('rsm_line_opacity', minimum=0.30,maximum=1.0))
+        area_fill = st.checkbox('Soft area fill under lines', value=False, key=restore_key('rsm_area_fill'))
         area_opacity = st.slider('Area fill opacity', min_value=0.05, max_value=0.50,
-                                 value=0.12, step=0.05) if area_fill else 0.12
-        show_grid = st.checkbox('Show subtle gridlines', value=True)
+                                 value=0.12, step=0.05, key=restore_key('rsm_area_opacity',minimum=0.05,maximum=0.50)) if area_fill else 0.12
+        show_grid = st.checkbox('Show subtle gridlines', value=True, key=restore_key('rsm_show_grid'))
         grid_opacity = st.slider('Grid opacity', min_value=0.0, max_value=0.50,
-                                 value=0.16, step=0.05) if show_grid else 0.0
-        distinguish_lines = st.checkbox('Different line styles for cases/wells', value=True)
+                                 value=0.16, step=0.05, key=restore_key('rsm_grid_opacity', minimum=0.0, maximum=0.50)) if show_grid else 0.0
+        distinguish_lines = st.checkbox('Different line styles for cases/wells', value=True, key=restore_key('rsm_distinguish_lines'))
         panel_height = st.slider('Height per Trellis row (px)', min_value=220,
-                                 max_value=650, value=340, step=20)
+                                 max_value=650, value=340, step=20, key=restore_key('rsm_panel_height',minimum=220,maximum=650))
         chart_point_max = st.number_input('Max plotted points per curve', min_value=200,
-                                          max_value=30000, value=5000, step=200)
+                                          max_value=30000, value=5000, step=200, key=restore_key('rsm_max_chart_points',minimum=200,maximum=30000))
 
 settings = {'Theme': theme, 'Transparent background': transparent, 'Font style': font_style,
             'Font size': font_size, 'Line width': line_width, 'Line opacity': line_opacity,
@@ -860,8 +1090,10 @@ s4.metric('Longest simulation', f"{max(p['qc']['Time_Max_Days'] for p in cases.v
 if any(p['qc']['Time_Mismatched_Blocks'] for p in cases.values()):
     st.warning('One or more RSM blocks have different TIME values; an outer join on simulation time was used.')
 
-tab_overview,tab_plots,tab_rank,tab_data,tab_export,tab_qc = st.tabs([
-    'Overview','Interactive plots & Trellis','Well ranking','Data explorer','Spotfire export','QC & dictionary'])
+tab_overview,tab_well_profiles,tab_volumes,tab_plots,tab_rank,tab_data,tab_export,tab_qc = st.tabs([
+    'Overview', 'Well by Well Profiles', 'Volumes & Recovery',
+    'Interactive plots & Trellis', 'Well ranking', 'Data explorer',
+    'Spotfire export', 'QC & dictionary'])
 
 with tab_overview:
     st.subheader('Field summary — last available timestep')
@@ -921,11 +1153,222 @@ with tab_overview:
                     config={'displaylogo':False,'responsive':True},
                 )
 
+
+with tab_well_profiles:
+    st.subheader('Well by Well — production & pressure dashboard')
+    st.caption('Select one or multiple wells; compare their profiles across cases. '
+               'Each dashboard panel uses the same curve engine and style settings as Overview.')
+    if not all_wells:
+        st.info('No well vectors detected in the uploaded .RSM files.')
+    else:
+        w1, w2, w3 = st.columns([2.6, 1.7, 1.5])
+        with w1:
+            selected_profile_wells = st.multiselect(
+                'Wells (multi-select)', all_wells, default=all_wells[:3],
+                key=restore_key('rsm_well_profile_wells',all_wells,multi=True))
+        with w2:
+            profile_cases = st.multiselect(
+                'Cases', list(cases), default=list(cases),
+                key=restore_key('rsm_well_profile_cases',list(cases),multi=True))
+        with w3:
+            profile_color = st.selectbox(
+                'Color curves by', ['Well', 'Case', 'Keyword'],
+                key=restore_key('rsm_well_profile_color',['Well','Case','Keyword']))
+        plot_vector_choices = [
+            ('WOPR', 'Oil production rate'), ('WWPR', 'Water production rate'),
+            ('WGPR', 'Gas production rate'), ('WOPT', 'Cumulative oil production'),
+            ('WWCT', 'Water cut'), ('WBHP', 'Bottomhole pressure'),
+            ('WTHP', 'Tubing-head pressure'), ('WWPT', 'Cumulative water production'),
+        ]
+        usable_well_kw = set(meta_all.loc[meta_all.Level.eq('Well'),'Keyword'])
+        dashboard_vectors = [p for p in plot_vector_choices if p[0] in usable_well_kw]
+        if not dashboard_vectors:
+            st.info('None of the standard production vectors are available in the RSM files.')
+        elif selected_profile_wells and profile_cases:
+            profile_subset = {k: cases[k] for k in profile_cases}
+            profile_settings = settings.copy()
+            profile_settings['Color by'] = {'Well':'Well / Entity',
+                                            'Case':'Case','Keyword':'Keyword'}[profile_color]
+            dashboard_keywords = [k for k,_ in dashboard_vectors]
+            for i in range(0,len(dashboard_vectors),2):
+                left,right = st.columns(2)
+                for panel,(kw,label) in zip((left,right),dashboard_vectors[i:i+2]):
+                    with panel:
+                        st.markdown(f'#### {label} · {kw}')
+                        curves,truncated = collect_plot_records(
+                            profile_subset,'Well',[kw],selected_profile_wells,
+                            unit_system,gas_display,True,maximum=250)
+                        if truncated:
+                            st.warning('Maximum 250 curves plotted in this panel.')
+                        if not curves:
+                            st.caption('No data for the selected wells/cases.')
+                            continue
+                        profile_settings['Chart title'] = label
+                        fig,_,_ = chart_factory(
+                            curves,x_mode,start_date,'Well',profile_cases,
+                            selected_profile_wells,dashboard_keywords,palette,
+                            profile_settings,render_backend='svg')
+                        fig.update_layout(
+                            title=None,height=440,autosize=True,
+                            margin=dict(t=20,b=155,l=65,r=40),
+                            legend=dict(orientation='h',x=0.5,xanchor='center',
+                                        y=-0.33,yanchor='top',bgcolor='rgba(0,0,0,0)',
+                                        font=dict(size=max(9,settings['Font size']-1))),
+                            uirevision=False)
+                        fig.update_xaxes(automargin=True)
+                        fig.update_yaxes(automargin=True)
+                        st.plotly_chart(fig,use_container_width=True,
+                                        key=f'well_dashboard_{kw}',
+                                        config={'displaylogo':False,'responsive':True})
+            st.markdown('**Last available values — selected wells**')
+            snapshot = summarize_last(profile_subset,'Well',dashboard_keywords,
+                                       selected_profile_wells,unit_system,gas_display)
+            if not snapshot.empty:
+                st.dataframe(snapshot,use_container_width=True,hide_index=True,height=300)
+                st.download_button('Download well profile snapshot (CSV)',
+                    snapshot.to_csv(index=False).encode('utf-8-sig'),
+                    file_name='Well_Profile_Snapshot.csv',mime='text/csv',
+                    key='rsm_download_well_snapshot')
+        else:
+            st.info('Choose at least one well and one case.')
+
+with tab_volumes:
+    st.subheader('Field oil volumes & recovery — by simulation case')
+    st.caption('Uses FOIP (oil in place), FOPT (cumulative oil produced), and FOE '
+               '(oil recovery efficiency) where available. No volume is derived by '
+               'integrating FOPR. Figures follow the current Field/Metric unit selection.')
+    with st.expander('STOIIP assumptions and manual overrides',expanded=False):
+        st.write('Automatic STOIIP = earliest valid FOIP; otherwise inferred from '
+                 'FOPT / FOE if both exist. If the simulation starts after initial '
+                 'conditions, validate this number against your independently '
+                 'verified STOIIP. Manual inputs supersede the automatic estimate.')
+        overrides={}
+        for case in cases:
+            c1,c2=st.columns([1,2])
+            with c1:
+                use_manual=st.checkbox(f'Override STOIIP · {case}',value=False,
+                    key=restore_key(f'rsm_vol_use_override_{case}'))
+            with c2:
+                if use_manual:
+                    v=st.number_input(f'Initial STOIIP ({"STB" if unit_system=="Field" else "Sm³"}) · {case}',
+                        min_value=0.0,value=0.0,step=1000000.0,format='%.2f',
+                        key=restore_key(f'rsm_vol_manual_{case}_{unit_system}',minimum=0.0))
+                    overrides[case]=v
+    volumes={case:_volume_detail(parsed,unit_system,gas_display,
+                               manual_stoiip=overrides.get(case))
+             for case,parsed in cases.items()}
+    summary=[]
+    for case,v in volumes.items():
+        summary.append({'Case':case,'Initial STOIIP (million)':v['initial']/1e6,
+                        'Recovered oil (million)':v['recovered']/1e6,
+                        'RF (%)':v['rf_final'],
+                        'Initial STOIIP source':v['initial_source'],
+                        'RF source':v['rf_source'],
+                        'Volume unit':'MMSTB' if v['unit'].upper()=='STB' else 'million Sm³'})
+    tbl=pd.DataFrame(summary)
+    st.dataframe(tbl,use_container_width=True,hide_index=True,
+                 column_config={
+                     'Initial STOIIP (million)':st.column_config.NumberColumn(format='%.2f'),
+                     'Recovered oil (million)':st.column_config.NumberColumn(format='%.2f'),
+                     'RF (%)':st.column_config.NumberColumn(format='%.2f%%')})
+    st.download_button('Download oil volumes and RF table (CSV)',
+                       tbl.to_csv(index=False).encode('utf-8-sig'),
+                       file_name='RSM_Oil_Volume_Recovery_Summary.csv',mime='text/csv',
+                       key='rsm_download_volume_csv')
+    focus_case=st.selectbox('KPI case',list(cases),
+                            key=restore_key('rsm_volume_kpi_case',list(cases)))
+    focus=volumes[focus_case]
+    k1,k2,k3=st.columns(3)
+    k1.metric('Initial STOIIP',_pretty_volume(focus['initial'],focus['unit']))
+    k2.metric('Recovered oil · end of run',_pretty_volume(focus['recovered'],focus['unit']))
+    k3.metric('Recovery factor (RF)',
+              f"{focus['rf_final']:,.2f}%" if np.isfinite(focus['rf_final']) else 'N/A')
+    if focus['notes']:
+        for note in focus['notes']:
+            st.warning(f'{focus_case}: {note}')
+    other_notes=[(case,msg) for case,v in volumes.items() if case != focus_case for msg in v['notes']]
+    if other_notes:
+        with st.expander(f'Additional QC notes ({len(other_notes)})'):
+            for case,msg in other_notes:
+                st.write(f'{case}: {msg}')
+    st.caption('Recovered oil = final reported FOPT; RF = FOPT / initial STOIIP '
+               '(or directly reported FOE if no reliable STOIIP can be determined).')
+
+    case_color={case:CASE_COLORS[i%len(CASE_COLORS)] for i,case in enumerate(cases)}
+    vol_u='MMSTB' if unit_system=='Field' else 'million Sm³'
+    with st.container():
+        left,right=st.columns(2)
+        with left:
+            st.markdown('#### Initial STOIIP by case')
+            frame=tbl[['Case','Initial STOIIP (million)']].dropna()
+            fig_initial=go.Figure()
+            fig_initial.add_trace(go.Bar(x=frame['Case'],y=frame['Initial STOIIP (million)'],
+                marker_color=[case_color[k] for k in frame['Case']],
+                text=[f'{z:,.2f}' for z in frame['Initial STOIIP (million)']],
+                textposition='outside',name='Initial STOIIP'))
+            _volume_figure_style(fig_initial,'Initial STOIIP',settings,vol_u)
+            fig_initial.update_layout(showlegend=False)
+            st.plotly_chart(fig_initial,use_container_width=True,key='volume_initial_bar',
+                            config={'displaylogo':False})
+        with right:
+            st.markdown('#### Recovered oil vs simulation time')
+            fig_recovered=go.Figure()
+            for case,v in volumes.items():
+                if np.isfinite(v['produced_curve']).any():
+                    fig_recovered.add_trace(go.Scatter(
+                        x=time_axis(v['days'],x_mode,start_date),
+                        y=v['produced_curve']/1e6,mode='lines',name=case,
+                        line=dict(color=case_color[case],width=settings['Line width'])))
+            _volume_figure_style(fig_recovered,'Recovered oil',settings,vol_u)
+            fig_recovered.update_xaxes(title_text=axis_label(x_mode))
+            st.plotly_chart(fig_recovered,use_container_width=True,key='volume_recovered_plot',
+                            config={'displaylogo':False})
+    left,right=st.columns(2)
+    with left:
+        st.markdown('#### Oil recovery factor vs simulation time')
+        fig_rf=go.Figure()
+        for case,v in volumes.items():
+            if np.isfinite(v['rf_curve']).any():
+                fig_rf.add_trace(go.Scatter(
+                    x=time_axis(v['days'],x_mode,start_date),
+                    y=v['rf_curve'],mode='lines',name=case,
+                    line=dict(color=case_color[case],width=settings['Line width'])))
+        _volume_figure_style(fig_rf,'Recovery factor',settings,'RF (%)')
+        fig_rf.update_xaxes(title_text=axis_label(x_mode))
+        st.plotly_chart(fig_rf,use_container_width=True,key='volume_rf_plot',
+                        config={'displaylogo':False})
+    with right:
+        st.markdown('#### Remaining oil in place (FOIP)')
+        fig_foip=go.Figure()
+        foip_found=False
+        for case,v in volumes.items():
+            if np.isfinite(v['foip_curve']).any():
+                foip_found=True
+                fig_foip.add_trace(go.Scatter(
+                    x=time_axis(v['days'],x_mode,start_date),
+                    y=v['foip_curve']/1e6,mode='lines',name=case,
+                    line=dict(color=case_color[case],width=settings['Line width'])))
+        if foip_found:
+            _volume_figure_style(fig_foip,'Oil in place',settings,vol_u)
+            fig_foip.update_xaxes(title_text=axis_label(x_mode))
+            st.plotly_chart(fig_foip,use_container_width=True,key='volume_remaining_plot',
+                            config={'displaylogo':False})
+        else:
+            st.info('No FOIP curves in these RSM files. Include FOIP to plot remaining oil in place.')
+    with st.expander('How the numbers are calculated'):
+        st.markdown('**Initial STOIIP:** FOIP at the first available timestamp, unless '
+            'manual STOIIP is supplied; if no FOIP, FOPT / FOE at a valid common timestep. '
+            '**Recovered:** FOPT cumulative oil at the final finite timestamp. '
+            '**Recovery factor:** 100 × FOPT / STOIIP; falls back to 100 × FOE '
+            'when STOIIP is not available. All summary scale factors and unit '
+            'conversions are applied before calculation. Blank values are not '
+            'silently treated as zero.')
+
 with tab_plots:
     st.subheader('Interactive engineering plots')
     c1,c2,c3 = st.columns([1,2,1.5])
     with c1:
-        chart_level = st.selectbox('Analysis level', levels, key='plot_level')
+        chart_level = st.selectbox('Analysis level', levels, key=restore_key('plot_level',levels))
     available_kw = sorted(meta_all.loc[meta_all.Level.eq(chart_level),'Keyword'].unique().tolist())
     suggested = {'Field':['FOPR','FWPR','FGPR'], 'Well':['WOPR','WWPR','WGPR'],
                  'Group':['GOPR','GWPR','GGPR']}.get(chart_level,[])
@@ -933,10 +1376,10 @@ with tab_plots:
         chart_kw = st.multiselect('ECLIPSE vectors · full column names', available_kw,
                                   default=[k for k in suggested if k in available_kw],
                                   format_func=keyword_label,
-                                  key=f'plot_keys_{chart_level}')
+                                  key=restore_key(f'plot_keys_{chart_level}',available_kw,multi=True))
     with c3:
         case_names = st.multiselect('Simulation cases', list(cases), default=list(cases),
-                                    key='plot_cases')
+                                    key=restore_key('plot_cases',list(cases),multi=True))
     if chart_level == 'Field':
         available_entities = ['FIELD']
         entities = ['FIELD']
@@ -944,17 +1387,19 @@ with tab_plots:
         available_entities = sorted(meta_all.loc[(meta_all.Level == chart_level) &
                               (meta_all.Keyword.isin(chart_kw)), 'Entity'].unique().tolist())
         entities = st.multiselect(f'{chart_level}s / entities', available_entities,
-                                  default=available_entities[:5], key=f'plot_entities_{chart_level}')
+                                  default=available_entities[:5], key=restore_key(f'plot_entities_{chart_level}',available_entities,multi=True))
     c4,c5,c6 = st.columns([1.2,1.4,2])
     with c4:
-        plot_layout = st.radio('Plot layout', ['Overlay','Trellis'], horizontal=True)
+        plot_layout = st.radio('Plot layout', ['Overlay','Trellis'], horizontal=True, key=restore_key('rsm_plot_layout',['Overlay','Trellis']))
     with c5:
-        color_by = st.selectbox('Color by', ['Fluid / Metric','Case','Well / Entity','Keyword'])
+        color_by = st.selectbox('Color by', ['Fluid / Metric','Case','Well / Entity','Keyword'],
+                                key=restore_key('rsm_plot_color_by',['Fluid / Metric','Case','Well / Entity','Keyword']))
     with c6:
-        custom_title = st.text_input('Chart title', value='RSM Production Profiles')
+        custom_title = st.text_input('Chart title', value='RSM Production Profiles',key=restore_key('rsm_chart_title'))
     settings['Chart title'] = custom_title
     settings['Color by'] = color_by
-    percent_wct = st.checkbox('Display water cut (%) on plots — CSV exports retain fractions', value=True)
+    percent_wct = st.checkbox('Display water cut (%) on plots — CSV exports retain fractions', value=True,
+                              key=restore_key('rsm_percent_watercut'))
     trellis_by = None
     ncols,nrows,page = 1,1,1
     subset = {c: cases[c] for c in case_names}
@@ -963,11 +1408,13 @@ with tab_plots:
         with t1:
             trellis_options = (['Well / Entity','Case','Keyword'] if chart_level != 'Field'
                                else ['Case','Keyword'])
-            trellis_by = st.selectbox('Trellis by', trellis_options, key='trellis_dimension')
+            trellis_by = st.selectbox('Trellis by', trellis_options, key=restore_key('trellis_dimension',trellis_options))
         with t2:
-            ncols = st.number_input('Horizontal · plots per row',min_value=1,max_value=6,value=3,step=1)
+            ncols = st.number_input('Horizontal · plots per row',min_value=1,max_value=6,value=3,step=1,
+                                    key=restore_key('rsm_trellis_cols',minimum=1,maximum=6))
         with t3:
-            nrows = st.number_input('Vertical · plot rows',min_value=1,max_value=6,value=2,step=1)
+            nrows = st.number_input('Vertical · plot rows',min_value=1,max_value=6,value=2,step=1,
+                                    key=restore_key('rsm_trellis_rows',minimum=1,maximum=6))
     if chart_kw and case_names and entities:
         records,truncated = collect_plot_records(subset, chart_level, chart_kw, entities,
                                                  unit_system,gas_display,percent_wct)
@@ -986,7 +1433,7 @@ with tab_plots:
                 st.caption(f'{len(facet_values)} Trellis panels · {ncols} horizontal × {nrows} vertical · {total_pages} page(s)')
                 if total_pages > 1:
                     page = st.number_input('Trellis page',min_value=1,max_value=total_pages,
-                                           value=1,step=1,key=f'trellis_page_{trellis_by}_{ncols}_{nrows}')
+                                           value=1,step=1,key=restore_key(f'trellis_page_{trellis_by}_{ncols}_{nrows}',minimum=1,maximum=total_pages))
             fig,n,skipped = chart_factory(records,x_mode,start_date,chart_level,case_names,
                                           entities,chart_kw,palette,settings,trellis_by,
                                           int(nrows),int(ncols),int(page))
@@ -1019,17 +1466,20 @@ with tab_rank:
         with col1:
             ranking_kw = st.selectbox('Ranking keyword',well_kw,
                                       index=well_kw.index('WOPR') if 'WOPR' in well_kw else 0,
-                                      format_func=keyword_label)
+                                      format_func=keyword_label,
+                                      key=restore_key('rsm_rank_keyword',well_kw))
         lo = float(min(p['qc']['Time_Min_Days'] for p in cases.values()))
         hi = float(max(p['qc']['Time_Max_Days'] for p in cases.values()))
         with col2:
             # Streamlit sliders reject a float range with an integer step.
             # number_input uses homogeneous native float parameters and supports decimals.
             ranking_day = st.number_input('Simulation day', min_value=lo,max_value=hi,
-                                          value=hi,step=1.0,format='%.2f')
+                                          value=hi,step=1.0,format='%.2f',
+                                           key=restore_key('rsm_rank_day',minimum=lo,maximum=hi))
         with col3:
             top_n = st.number_input('Top wells per case',min_value=1,
-                                    max_value=max(1,len(all_wells)),value=min(20,max(1,len(all_wells))),step=1)
+                                    max_value=max(1,len(all_wells)),value=min(20,max(1,len(all_wells))),step=1,
+                                     key=restore_key('rsm_top_wells',minimum=1,maximum=max(1,len(all_wells))))
         data=[]
         for case,parsed in cases.items():
             td=parsed['data'].index.to_numpy(dtype=float)
@@ -1066,7 +1516,7 @@ with tab_data:
     st.subheader('Tabular data explorer')
     a,b=st.columns([1,2])
     with a:
-        explorer_level=st.selectbox('Analysis level',levels,key='explorer_level')
+        explorer_level=st.selectbox('Analysis level',levels,key=restore_key('explorer_level',levels))
     av=sorted(meta_all.loc[meta_all.Level.eq(explorer_level),'Keyword'].unique().tolist())
     pref={'Field':['FOPR','FWPR','FGPR','FOPT'],
           'Well':['WOPR','WWPR','WGPR','WOPT'],
@@ -1074,13 +1524,13 @@ with tab_data:
     with b:
         explorer_kw=st.multiselect('Keyword · full name',av,
                                    default=[k for k in pref if k in av],
-                                   format_func=keyword_label,key=f'expl_kw_{explorer_level}')
+                                   format_func=keyword_label,key=restore_key(f'expl_kw_{explorer_level}',av,multi=True))
     if explorer_level=='Field':
         explorer_ent=['FIELD']
     else:
         ent_options=sorted(meta_all.loc[meta_all.Level.eq(explorer_level),'Entity'].unique().tolist())
         explorer_ent=st.multiselect('Entities',ent_options,default=ent_options[:3],
-                                    key=f'expl_ent_{explorer_level}')
+                                    key=restore_key(f'expl_ent_{explorer_level}',ent_options,multi=True))
     st.caption('Preview capped at 3,000 rows. All raw timesteps remain available in CSV export.')
     if explorer_kw and explorer_ent:
         tab=preview_records(cases,explorer_level,explorer_kw,explorer_ent,
@@ -1094,23 +1544,26 @@ with tab_export:
     st.subheader('Spotfire-ready merged datasets')
     st.write('Selected runs are **stacked into one dataset** with `Case`, `Keyword`, '
              '`Column_Name`, `Entity`, `Unit` and simulation time. No renaming of ECLIPSE keywords is forced.')
-    exp_level=st.radio('Data scope',levels+['All'],horizontal=True,key='export_level')
+    exp_level=st.radio('Data scope',levels+['All'],horizontal=True,key=restore_key('export_level',levels+['All']))
     submeta=meta_all if exp_level=='All' else meta_all.loc[meta_all.Level.eq(exp_level)]
     choices=sorted(submeta.Keyword.unique().tolist())
     ex_defaults=['FOPR','FWPR','FGPR','FOPT','FWPT','FGPT','FWCT','FPR',
                  'WOPR','WWPR','WGPR','WOPT','WWPT','WGPT','WWCT','WBHP','WTHP']
-    export_all=st.checkbox(f'Include all {len(choices)} variables',value=False)
+    export_all=st.checkbox(f'Include all {len(choices)} variables',value=False,
+                           key=restore_key('rsm_export_all'))
     export_kw=st.multiselect('Keyword / full name',choices,
                              default=choices if export_all else [x for x in ex_defaults if x in choices],
-                             format_func=keyword_label,key=f'export_kw_{exp_level}_{export_all}')
+                             format_func=keyword_label,key=restore_key(f'export_kw_{exp_level}_{export_all}',choices,multi=True))
     export_wells=[]
     if exp_level in ('Well','All'):
-        export_wells=st.multiselect('Optional well filter · empty = all wells',all_wells,default=[])
+        export_wells=st.multiselect('Optional well filter · empty = all wells',all_wells,default=[],
+                                     key=restore_key('rsm_export_wells',all_wells,multi=True))
     long_header_preview='Case,Date,Time_Days,Years,Level,Entity,Variable,Keyword,Column_Name,Unit,Value'
     st.code(long_header_preview+'\nCase_A,,365,0.9993,Field,FIELD,FOPR,FOPR,Field Oil Production Rate,STB/day,1000',
             language='csv')
     descriptive_wide=st.checkbox('Wide CSV: include full name in column headers',value=False,
-                                  help='Off = compact ECLIPSE keyword headers. On = FOPR — Field Oil Production Rate.')
+                                  help='Off = compact ECLIPSE keyword headers. On = FOPR — Field Oil Production Rate.',
+                                  key=restore_key('rsm_export_descriptive'))
     selection={}
     series_count=0
     estimated_rows=0
@@ -1124,7 +1577,8 @@ with tab_export:
     st.caption(f'{len(cases)} cases · {series_count:,} vectors · up to {estimated_rows:,} Long CSV rows before null filtering.')
     if estimated_rows>2_500_000:
         st.warning('Large dataset. Streamlit Cloud memory can be limited. Reduce keyword or well selections if needed.')
-    export_zip=st.checkbox('Combine Long, Wide and Dictionary CSV in a ZIP',value=True)
+    export_zip=st.checkbox('Combine Long, Wide and Dictionary CSV in a ZIP',value=True,
+                           key=restore_key('rsm_export_zip'))
     if st.button('Generate Spotfire exports',type='primary',disabled=series_count==0):
         try:
             with st.spinner('Building all-case CSV files...'):
@@ -1224,3 +1678,21 @@ with tab_qc:
         st.warning('Unit conversions not recognized — values preserved: '+
                    ', '.join(f'{k} [{u}]' for k,u in sorted(set(unsupported))[:25]))
     st.caption('Original RSM scaling and source units are preserved as metadata. Unknown keywords receive neutral labels.')
+
+
+with st.sidebar:
+    st.divider()
+    st.markdown('**Save complete display configuration**')
+    st.caption('Save the selected wells, cases, plot settings, filters, date, '
+               'STOIIP overrides and export preferences. RSM data is excluded.')
+    st.download_button(
+        '⬇ Download design template (.json)',
+        data=download_profile_json(cases.keys(),original_names.values()),
+        file_name='Eclipse_RSM_Studio_Design_Template.json',
+        mime='application/json',
+        key='rsm_template_download',
+        use_container_width=True)
+    expected = st.session_state.get('_rsm_profile_source_files') or []
+    missing = sorted(set(expected)-set(original_names.values()))
+    if missing:
+        st.warning('Template references RSM files not currently loaded: '+', '.join(missing[:8]))
